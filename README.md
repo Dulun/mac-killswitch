@@ -32,6 +32,8 @@ alias（写进 `~/.zshrc`）：
 alias ks="$HOME/Documents/dev/mac-killswitch/killswitch.sh"
 ```
 
+**前置条件（脚本会自己检查，不满足直接拒绝开启）**：Clash 必须是 **TUN 开启 + 全局模式 + 选好一个真节点**。原因：kill switch 的放行名单只有「隧道 + 局域网 + 当前节点 + DNS」，规则模式下国内直连会被一起丢光（百度这类站点会挂）——所以按 `1` 时会自动切全局（并按 `2` 还原原模式）。
+
 换机器：clone + `cp config.env.example config.env` 就行——脚本会自动找 Clash Verge 的控制 socket、TUN 设备，并**自动读取你当前选中的节点 IP:端口**（换节点后重按一次 `1` 即可刷新白名单）。
 想手动指定（比如节点在 TUN 外、或自动读不到）就在 `config.env` 里填 `NODE_ENDPOINTS=1.2.3.4:443,...`，填了就以手填为准。
 

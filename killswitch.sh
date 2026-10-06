@@ -152,7 +152,6 @@ detect_endpoints() {
   pf="$(current_profile_file)"; [ -f "$pf" ] || return 1
   node="$(clash_now GLOBAL)"; [ -z "$node" ] && node="$(clash_now '🚀 节点选择')"
   case "$node" in ""|DIRECT|REJECT|REJECT-DROP) return 1 ;; esac
-  printf '%s' "$node" >&2
   eps="$(python3 "$ROOT_DIR/lib/node_endpoints.py" "$pf" "$node" 2>/dev/null)"
   [ -n "$eps" ] || return 1
   # 域名形式的 server → 解析成真实 IP（走隧道用 DoH，避免 fake-ip）
@@ -254,8 +253,40 @@ print_verify() {
 
 # ---- 动作 -------------------------------------------------------------------
 do_on() {
-  local fw_only=0 tun f mode node
+  local fw_only=0 tun f mode node eff
   [ "${1:-}" = "--fw-only" ] && fw_only=1
+  if ! ensure_sudo; then return 1; fi
+
+  # ① 必须先确认「全局模式 + 有真节点」，否则防火墙 + 规则模式 = 国内直连也被丢（百度这类会挂）
+  if [ "$fw_only" = "0" ]; then
+    if [ -z "${SOCK:-}" ]; then
+      bad "找不到 Clash 控制 socket：无法确认/切换全局模式"
+      say "  规则模式下开防火墙会把国内直连也丢光，所以这里直接中止"
+      return 1
+    fi
+    mode="$(clash_mode)"
+    [ -n "$mode" ] && printf '%s' "$mode" > "$STATE_DIR/mode.saved"
+    if [ "$mode" != "global" ]; then
+      node="$(clash_now GLOBAL)"; [ -z "$node" ] && node="$(clash_now '🚀 节点选择')"
+      clash_set_mode global
+      case "$node" in ""|DIRECT|REJECT|REJECT-DROP) ;; *) clash_select GLOBAL "$node" ;; esac
+      if [ "$(clash_mode)" != "global" ]; then
+        bad "切换全局模式失败，已中止（防火墙没动）"; return 1
+      fi
+      ok "Clash 已切全局模式（原模式 ${mode} 已记录，按 2 会还原）"
+    fi
+    eff="$(clash_now GLOBAL)"; [ -z "$eff" ] && eff="$(clash_now '🚀 节点选择')"
+    case "$eff" in
+      ""|DIRECT|REJECT|REJECT-DROP)
+        bad "全局出口指向「${eff:-空}」：开了防火墙＝全断网。先在 Clash 里选一个真节点再按 1"
+        return 1 ;;
+    esac
+    ok "当前出口节点：${eff}"
+  else
+    dim "（--fw-only：不动 Clash 模式；规则模式下国内直连会被丢包，自己确认白名单够用）"
+  fi
+
+  # ② 节点白名单
   if [ -z "$NODE_ENDPOINTS" ]; then
     NODE_ENDPOINTS="$(detect_endpoints)"
     if [ -z "$NODE_ENDPOINTS" ]; then
@@ -263,8 +294,8 @@ do_on() {
     fi
     ok "已从 Clash 自动获取当前节点：${NODE_ENDPOINTS}"
   fi
-  if ! ensure_sudo; then return 1; fi
 
+  # ③ TUN 必须在
   if [ -n "${SOCK:-}" ] && [ "$(clash_tun)" != "true" ]; then
     bad "Clash 的 TUN 没开：现在开 kill switch 会变成全断网（连节点都到不了）"
     say "  先在 Clash Verge 里打开 TUN（设置 → 虚拟网卡/TUN 模式），再重按 1"
@@ -320,7 +351,7 @@ do_status() {
   say "TUN 设备  : $(tun_device)"
   if [ -n "$NODE_ENDPOINTS" ]; then say "节点白名单: ${NODE_ENDPOINTS}（config.env 手动指定）"
   else say "节点白名单: $(detect_endpoints)（自动：Clash 当前选中节点）"; fi
-  say "Clash 模式: $(clash_mode)"
+  say "Clash 模式: $(clash_mode)$( [ -f "$STATE_DIR/on" ] && [ "$(clash_mode)" != "global" ] && printf ' ← ⚠ 非全局模式 + 防火墙开启 = 国内直连会被丢' )"
   say "Clash TUN : $(clash_tun)（$(tun_device)）"
   has_sudo && dim "sudo      : 已授权（缓存中）" || dim "sudo      : 下次开启时会要一次密码"
   if [ -f "$STATE_DIR/on" ]; then ok "kill switch 已开启（$(cat "$STATE_DIR/on")）"; else dim "kill switch 未开启"; fi
@@ -345,7 +376,13 @@ EOF
 menu() {
   while :; do
     local state egress
-    if [ -f "$STATE_DIR/on" ]; then state="${C_OK}已开启${C_OFF}（只走节点，旁路断网）"; else state="${C_DIM}未开启${C_OFF}（正常上网）"; fi
+    if [ -f "$STATE_DIR/on" ]; then
+      state="${C_OK}已开启${C_OFF}（只走节点，旁路断网）"
+      case "$(clash_mode)" in ""|global) ;; *)
+        say "${C_BAD}⚠ Clash 不是全局模式（$(clash_mode)）：国内直连会被防火墙丢掉，百度这类站点会挂${C_OFF}"
+        say "${C_BAD}  → 按 2 关掉，或按 1 重开（会自动切全局）${C_OFF}" ;;
+      esac
+    else state="${C_DIM}未开启${C_OFF}（正常上网）"; fi
     egress="$(tunnel_egress)"
     say ""
     say "====================  mac-killswitch  ===================="
