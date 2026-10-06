@@ -116,6 +116,11 @@ clash_line() {
   tun="$(clash_tun)"; mode="$(clash_mode)"; dev="$(tun_device)"
   node="$(clash_now GLOBAL)"; [ -z "$node" ] && node="$(clash_now '🚀 节点选择')"
   say " Clash: 模式=${mode:-未知}   TUN=${tun:-未知}（${dev}）   节点=${node:-未知}"
+  case "$node" in
+    ""|DIRECT|REJECT|REJECT-DROP)
+      bad "全局出口指向「${node:-无}」＝直连：国外站点会超时/被墙（pi、Claude 之类的 API 连接被重置就是这个）"
+      dim "  → 在 Clash 的 GLOBAL 里选一个真节点，或切回规则模式" ;;
+  esac
   [ "$tun" != "true" ] && bad "Clash TUN 没开：开启后流量无处可去＝全断网。先在 Clash 打开 TUN/虚拟网卡。"
   [ "$mode" != "global" ] && dim "（规则模式：开启时脚本会自动切到 global，关闭时还原）"
   return 0
@@ -146,7 +151,8 @@ detect_endpoints() {
   local pf node eps
   pf="$(current_profile_file)"; [ -f "$pf" ] || return 1
   node="$(clash_now GLOBAL)"; [ -z "$node" ] && node="$(clash_now '🚀 节点选择')"
-  [ -n "$node" ] || return 1
+  case "$node" in ""|DIRECT|REJECT|REJECT-DROP) return 1 ;; esac
+  printf '%s' "$node" >&2
   eps="$(python3 "$ROOT_DIR/lib/node_endpoints.py" "$pf" "$node" 2>/dev/null)"
   [ -n "$eps" ] || return 1
   # 域名形式的 server → 解析成真实 IP（走隧道用 DoH，避免 fake-ip）
