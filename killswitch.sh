@@ -188,7 +188,10 @@ do_on() {
   local fw_only=0 tun f mode node
   [ "${1:-}" = "--fw-only" ] && fw_only=1
   [ -n "$NODE_ENDPOINTS" ] || { bad "config.env 里没配 NODE_ENDPOINTS"; exit 1; }
-  has_sudo || { sudo_hint; exit 1; }
+  if ! has_sudo; then
+    say "第一次使用，需要授权一次（照常输入你的密码即可，之后永不再问）"
+    do_setup_sudo || exit 1
+  fi
 
   tun="$(tun_device)"
   f="$BUILD_DIR/pf.rules"
@@ -251,33 +254,38 @@ usage() {
   cat <<EOF
 mac-killswitch — fail-closed 网络开关
 
-  killswitch.sh setup-sudo    一次性授权（只弹一次密码，写 /etc/sudoers.d）
-  killswitch.sh on            开启（防火墙 + Clash 全局）
-  killswitch.sh on --fw-only  只开防火墙，保留 Clash 规则模式
-  killswitch.sh off           关闭并还原
-  killswitch.sh status        状态
-  killswitch.sh check         自检（旁路必须被丢包 / 隧道必须通）
-  killswitch.sh rules         只打印将要载入的 pf 规则
-  killswitch.sh               交互菜单
+  ks                    ← 直接敲这个，出菜单（推荐，不用记参数）
+  ks on                 开启（防火墙 + Clash 全局）
+  ks off                关闭并还原
+  ks status / check     状态 / 自检
+  ks setup-sudo         可选：一次性免密授权
 EOF
 }
 
 menu() {
   while :; do
+    local state egress
+    if [ -f "$STATE_DIR/on" ]; then state="${C_OK}已开启${C_OFF}（只走节点，旁路断网）"; else state="${C_DIM}未开启${C_OFF}（正常上网）"; fi
+    egress="$(tunnel_egress)"
     say ""
-    say "mac-killswitch$([ -f "$STATE_DIR/on" ] && echo "  [已开启]")"
-    say "  1) 开启（严格：防火墙 + 全局走节点）"
-    say "  2) 开启（只开防火墙，保留规则分流）"
-    say "  3) 关闭并还原"
-    say "  4) 状态"
-    say "  5) 自检"
-    say "  6) 一次性授权（免密）"
+    say "====================  mac-killswitch  ===================="
+    say " 状态: ${state}"
+    say " 出口: ${egress:-（测不到，检查 Clash/节点）}   Clash 模式: $(clash_mode)"
+    say " 节点: ${NODE_ENDPOINTS}"
+    say "========================================================="
+    say "  1) 开启   → 防火墙 + 全局走节点（国内直连也会断，这就是目的）"
+    say "  2) 关闭   → 一切恢复原样（没网时用这个）"
+    say "  3) 自检   → 看旁路是否真被丢包、隧道是否通"
+    say "  4) 详情   → 状态原始信息"
     say "  q) 退出"
-    printf '请选择: '; read -r c
+    printf ' 选择: '; read -r c
     case "$c" in
-      1) do_on;; 2) do_on --fw-only;; 3) do_off;; 4) do_status;; 5) do_check;;
-      6) do_setup_sudo;; q|Q|"") return;;
-      *) bad "无效选择";;
+      1) do_on;;
+      2) do_off;;
+      3) do_check;;
+      4) do_status;;
+      q|Q|"") return;;
+      *) bad "请输入 1 / 2 / 3 / 4 / q";;
     esac
   done
 }
