@@ -100,10 +100,26 @@ api() {
     curl -s --max-time 8 --unix-socket "$SOCK" -X "$m" "http://localhost$p"
   fi
 }
-clash_mode()     { api GET /configs | jq -r '.mode // empty' 2>/dev/null; }
+clash_cfg()      { api GET /configs | jq -r "$1 // empty" 2>/dev/null; }
+clash_mode()     { clash_cfg '.mode'; }
+clash_tun()      { clash_cfg '.tun.enable'; }   # true/false
 clash_set_mode() { api PATCH /configs "{\"mode\":\"$1\"}" >/dev/null; }
 clash_now()      { api GET /proxies | jq -r --arg n "$1" '.proxies[$n].now // empty' 2>/dev/null; }
 clash_select()   { api PUT "/proxies/$1" "{\"name\":\"$2\"}" >/dev/null; }
+
+clash_line() {
+  if [ -z "${SOCK:-}" ]; then
+    bad "Clash: 找不到控制 socket（未运行？）——此时开启＝全断网"
+    return
+  fi
+  local tun mode node dev
+  tun="$(clash_tun)"; mode="$(clash_mode)"; dev="$(tun_device)"
+  node="$(clash_now GLOBAL)"; [ -z "$node" ] && node="$(clash_now '🚀 节点选择')"
+  say " Clash: 模式=${mode:-未知}   TUN=${tun:-未知}（${dev}）   节点=${node:-未知}"
+  [ "$tun" != "true" ] && bad "Clash TUN 没开：开启后流量无处可去＝全断网。先在 Clash 打开 TUN/虚拟网卡。"
+  [ "$mode" != "global" ] && dim "（规则模式：开启时脚本会自动切到 global，关闭时还原）"
+  return 0
+}
 
 tun_device() {
   local d
@@ -243,6 +259,11 @@ do_on() {
   fi
   if ! ensure_sudo; then return 1; fi
 
+  if [ -n "${SOCK:-}" ] && [ "$(clash_tun)" != "true" ]; then
+    bad "Clash 的 TUN 没开：现在开 kill switch 会变成全断网（连节点都到不了）"
+    say "  先在 Clash Verge 里打开 TUN（设置 → 虚拟网卡/TUN 模式），再重按 1"
+    return 1
+  fi
   tun="$(tun_device)"
   f="$BUILD_DIR/pf.rules"
   gen_rules "$tun"
@@ -294,6 +315,7 @@ do_status() {
   if [ -n "$NODE_ENDPOINTS" ]; then say "节点白名单: ${NODE_ENDPOINTS}（config.env 手动指定）"
   else say "节点白名单: $(detect_endpoints)（自动：Clash 当前选中节点）"; fi
   say "Clash 模式: $(clash_mode)"
+  say "Clash TUN : $(clash_tun)（$(tun_device)）"
   has_sudo && dim "sudo      : 已授权（缓存中）" || dim "sudo      : 下次开启时会要一次密码"
   if [ -f "$STATE_DIR/on" ]; then ok "kill switch 已开启（$(cat "$STATE_DIR/on")）"; else dim "kill switch 未开启"; fi
   say "出口 IP   : $(tunnel_egress)"
@@ -322,7 +344,8 @@ menu() {
     say ""
     say "====================  mac-killswitch  ===================="
     say " 状态: ${state}"
-    say " 出口: ${egress:-（测不到，检查 Clash/节点）}   Clash 模式: $(clash_mode)"
+    say " 出口: ${egress:-（测不到，检查 Clash/节点）}"
+    clash_line
     if [ -n "$NODE_ENDPOINTS" ]; then say " 节点: ${NODE_ENDPOINTS}   节点来源: config.env"; else say " 节点: $(detect_endpoints)   节点来源: 自动（Clash）"; fi
     say "========================================================="
     say "  1) 开启   → 防火墙 + 全局走节点（国内直连也会断，这就是目的）"
