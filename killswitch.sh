@@ -60,7 +60,7 @@ do_authorize() {
   if ! sudo /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"; bad "规则校验失败，已放弃（系统未改动）"; return 1
   fi
-  if sudo /bin/sh -c "mkdir -p /etc/sudoers.d && cp '$tmp' '$SUDOERS_FILE' && chmod 440 '$SUDOERS_FILE' && chown root:wheel '$SUDOERS_FILE'"; then
+  if sudo /bin/sh -c "mkdir -p /etc/sudoers.d; rm -f '$SUDOERS_FILE'; /usr/bin/install -m 440 -o root -g wheel '$tmp' '$SUDOERS_FILE'"; then
     rm -f "$tmp"
     if sudo -n "$PFC" -s info >/dev/null 2>&1; then
       ok "授权完成：以后 ks 不再问密码"
