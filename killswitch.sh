@@ -116,6 +116,33 @@ tun_device() {
   printf '%s' "${d:-utun1024}"
 }
 
+# ---- 自动探测当前节点 -------------------------------------------------------
+VERGE_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+
+current_profile_file() {
+  local cur
+  cur="$(grep -E '^current:' "${VERGE_DIR}/profiles.yaml" 2>/dev/null | awk '{print $2}')"
+  [ -n "$cur" ] && printf '%s' "${VERGE_DIR}/profiles/${cur}.yaml"
+}
+
+# 输出 IP:PORT[,IP:PORT ...]；取 GLOBAL（全局模式）或 🚀 节点选择 当前选中的那个节点
+detect_endpoints() {
+  local pf node eps
+  pf="$(current_profile_file)"; [ -f "$pf" ] || return 1
+  node="$(clash_now GLOBAL)"; [ -z "$node" ] && node="$(clash_now '🚀 节点选择')"
+  [ -n "$node" ] || return 1
+  eps="$(python3 "$ROOT_DIR/lib/node_endpoints.py" "$pf" "$node" 2>/dev/null)"
+  [ -n "$eps" ] || return 1
+  # 域名形式的 server → 解析成真实 IP（走隧道用 DoH，避免 fake-ip）
+  printf '%s' "$eps" | while IFS= read -r ep; do
+    host="${ep%%:*}"; port="${ep#*:}"
+    case "$host" in
+      *[!0-9.]*) for ip in $(resolve_a "$host"); do printf '%s:%s\n' "$ip" "$port"; done ;;
+      *) printf '%s:%s\n' "$host" "$port" ;;
+    esac
+  done | paste -sd, -
+}
+
 # ---- pf 规则 ----------------------------------------------------------------
 # 走隧道用 DoH 查真实 IP（本机 dig 会被 Clash 劫持返回 fake-ip 198.18.x）
 resolve_a() {
@@ -207,7 +234,13 @@ print_verify() {
 do_on() {
   local fw_only=0 tun f mode node
   [ "${1:-}" = "--fw-only" ] && fw_only=1
-  [ -n "$NODE_ENDPOINTS" ] || { bad "config.env 里没配 NODE_ENDPOINTS"; return 1; }
+  if [ -z "$NODE_ENDPOINTS" ]; then
+    NODE_ENDPOINTS="$(detect_endpoints)"
+    if [ -z "$NODE_ENDPOINTS" ]; then
+      bad "自动获取节点失败，请在 config.env 里手动填 NODE_ENDPOINTS"; return 1
+    fi
+    ok "已从 Clash 自动获取当前节点：${NODE_ENDPOINTS}"
+  fi
   if ! ensure_sudo; then return 1; fi
 
   tun="$(tun_device)"
@@ -258,7 +291,8 @@ do_off() {
 do_status() {
   say "SOCK      : ${SOCK:-（未找到 clash 控制 socket）}"
   say "TUN 设备  : $(tun_device)"
-  say "节点白名单: ${NODE_ENDPOINTS:-（空）}"
+  if [ -n "$NODE_ENDPOINTS" ]; then say "节点白名单: ${NODE_ENDPOINTS}（config.env 手动指定）"
+  else say "节点白名单: $(detect_endpoints)（自动：Clash 当前选中节点）"; fi
   say "Clash 模式: $(clash_mode)"
   has_sudo && dim "sudo      : 已授权（缓存中）" || dim "sudo      : 下次开启时会要一次密码"
   if [ -f "$STATE_DIR/on" ]; then ok "kill switch 已开启（$(cat "$STATE_DIR/on")）"; else dim "kill switch 未开启"; fi
@@ -289,7 +323,7 @@ menu() {
     say "====================  mac-killswitch  ===================="
     say " 状态: ${state}"
     say " 出口: ${egress:-（测不到，检查 Clash/节点）}   Clash 模式: $(clash_mode)"
-    say " 节点: ${NODE_ENDPOINTS}"
+    if [ -n "$NODE_ENDPOINTS" ]; then say " 节点: ${NODE_ENDPOINTS}   节点来源: config.env"; else say " 节点: $(detect_endpoints)   节点来源: 自动（Clash）"; fi
     say "========================================================="
     say "  1) 开启   → 防火墙 + 全局走节点（国内直连也会断，这就是目的）"
     say "  2) 关闭   → 一切恢复原样（没网时用这个）"
@@ -315,7 +349,9 @@ case "${1:-menu}" in
   off)    shift; do_off "$@";;
   status) do_status;;
   check)  do_check;;
-  rules)  gen_rules "$(tun_device)"; cat "$BUILD_DIR/pf.rules";;
+  rules)  if [ -z "$NODE_ENDPOINTS" ]; then NODE_ENDPOINTS="$(detect_endpoints)"; fi
+          gen_rules "$(tun_device)"; cat "$BUILD_DIR/pf.rules";;
+  node)   say "Clash 当前选中: $(clash_now GLOBAL)"; say "自动探测端点: $(detect_endpoints)";;
   menu|"") menu;;
   -h|--help|help) usage;;
   *) usage; exit 1;;

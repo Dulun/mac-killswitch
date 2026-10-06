@@ -22,7 +22,7 @@ macOS 上的 **fail-closed 网络开关**：要么全部流量走 Clash(TUN)→�
 ```bash
 git clone git@github.com:<you>/mac-killswitch.git ~/Documents/dev/mac-killswitch
 cd ~/Documents/dev/mac-killswitch
-cp config.env.example config.env    # 填自己的节点 IP:端口
+cp config.env.example config.env    # 什么都不用填：节点 IP:端口 会自动从 Clash 当前选中节点读取
 chmod +x killswitch.sh
 ```
 
@@ -32,7 +32,8 @@ alias（写进 `~/.zshrc`）：
 alias ks="$HOME/Documents/dev/mac-killswitch/killswitch.sh"
 ```
 
-换机器：clone + `cp config.env.example config.env` + 改节点即可，脚本会自动找 Clash Verge 的控制 socket 和 TUN 设备。
+换机器：clone + `cp config.env.example config.env` 就行——脚本会自动找 Clash Verge 的控制 socket、TUN 设备，并**自动读取你当前选中的节点 IP:端口**（换节点后重按一次 `1` 即可刷新白名单）。
+想手动指定（比如节点在 TUN 外、或自动读不到）就在 `config.env` 里填 `NODE_ENDPOINTS=1.2.3.4:443,...`，填了就以手填为准。
 
 ## 用法
 
@@ -72,7 +73,7 @@ App ──► utun（Clash TUN）──► mihomo ──► 节点 IP:PORT ─�
 
 - **开启后 Clash 的 DIRECT 分流会被掐死**（国内直连站点连不上）。想要"能上网且不直连"，用默认的全局模式；想保留规则分流用 `ks on --fw-only`，但要接受国内直连规则失败。
 - 同时装着 Tailscale / Shadowrocket / V2rayU 等别的 VPN：它们的直连会被一起掐，这是预期行为。
-- 换节点：改 `config.env` 的 `NODE_ENDPOINTS` 再 `ks on`（订阅里那些域名解析的动态节点没法预先写白名单）。
+- 换节点：直接切，然后重按一次 `ks` → `1` 刷新白名单（脚本会读 Clash 当前选中节点的 server/port；节点 `server` 写域名时会走 DoH 解析成真实 IP）。
 - `route-exclude-address` 这类绕过 TUN 的地址也会被掐，需要的话加进 `ALLOW_PORTS_EXTRA`。
 - 重启后 pf 恢复系统默认（**默认不开启**）；需要常驻可自己加 LaunchDaemon。
 - 脚本执行需要 root（`sudo`），因此 `ks` 会提示输入密码。
