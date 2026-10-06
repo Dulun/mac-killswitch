@@ -3,10 +3,13 @@
 # 用法：  ./fix-sudo.sh      （会要一次密码）
 set -eu
 
-U="$(id -un)"
-[ "$U" = "root" ] && U="${SUDO_USER:-}"
+U="${1:-}"
+if [ -z "$U" ]; then
+  U="$(id -un)"
+  [ "$U" = "root" ] && U="${SUDO_USER:-}"
+fi
 if [ -z "$U" ] || [ "$U" = "root" ]; then
-  echo "请不要用 root 运行（用你自己的账号跑这个脚本）" >&2; exit 1
+  echo "用法: $0 [用户名]   （不提权运行；或用 fix-sudo.sh tony 走 root 弹窗安装）" >&2; exit 1
 fi
 id -u "$U" >/dev/null 2>&1 || { echo "用户 $U 不存在" >&2; exit 1; }
 
@@ -19,6 +22,10 @@ sudo /usr/sbin/visudo -cf "$T" || { echo "规则校验失败，未做任何改�
 
 echo "→ 安装到 /etc/sudoers.d/mac-killswitch（覆盖旧的坏文件）…"
 sudo /bin/sh -c "rm -f /etc/sudoers.d/mac-killswitch; /usr/bin/install -m 440 -o root -g wheel '$T' /etc/sudoers.d/mac-killswitch"
+
+if [ "$(id -u)" = "0" ]; then
+  echo "✅ 已安装（root 身份跳过自验，稍后以 $U 身份验证）"; exit 0
+fi
 
 echo "→ 验证免密…"
 if sudo -n /sbin/pfctl -s info >/dev/null 2>&1; then
