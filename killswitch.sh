@@ -156,7 +156,7 @@ print_verify() {
   say ""
   say "自检："
   if has_sudo && [ -n "$iface" ]; then
-    p0="$(block_packets)"; p0="${p0:-0}"
+    p0="$(block_packets)"
     # 制造"绕过 TUN 的直连"尝试：先强制路由到物理网卡（不改全局路由，用完即删）
     for t in $PROBE_IPS; do
       sr -n add -host "$t" -interface "$iface" >/dev/null 2>&1
@@ -166,12 +166,16 @@ print_verify() {
     done
     curl -s --noproxy '*' --connect-timeout 2 --max-time 3 -o /dev/null http://1.1.1.1/ 2>/dev/null
     sleep 1
-    p1="$(block_packets)"; p1="${p1:-0}"
-    if [ "$p1" -gt "$p0" ]; then
-      ok "旁路尝试被防火墙丢弃（block 计数 ${p0} → ${p1}）"
-    else
-      bad "旁路尝试没有被丢弃（block 计数没变：${p0}）→ 规则可能没生效"
-    fi
+    p1="$(block_packets)"
+    case "${p0}${p1}" in
+      *[!0-9]*|"") dim "（读不到 block 计数器，跳过该项自检）" ;;
+      *)
+        if [ "$p1" -gt "$p0" ]; then
+          ok "旁路尝试被防火墙丢弃（block 计数 ${p0} → ${p1}）"
+        else
+          bad "旁路尝试没有被丢弃（block 计数没变：${p0}）→ 规则可能没生效"
+        fi ;;
+    esac
   else
     dim "（未授权 sudo，跳过防火墙自检）"
   fi
