@@ -4,14 +4,21 @@
 # 开启后：出网只允许 ① 回环 ② 局域网 ③ Clash TUN 隧道内 ④ 到节点 IP/端口 ⑤ 到 DNS 服务器
 # 其余一律丢包（v4 + v6 + 入站）。Clash/TUN 挂掉 = 直接断网，绝不裸奔。
 #
-# 首次使用：ks setup-sudo（只弹一次密码，之后全程免密）
+# 全程交互：敲 ks 出菜单；需要时输一次密码（sudo 缓存几分钟）
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="$ROOT/.state"; BUILD_DIR="$ROOT/.build"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT_DIR/.state"; BUILD_DIR="$ROOT_DIR/.build"
 mkdir -p "$STATE_DIR" "$BUILD_DIR"
 
-[ -f "$ROOT/config.env" ] && . "$ROOT/config.env"
+AM_ROOT=0; [ "$(id -u)" = "0" ] && AM_ROOT=1
+OWNER_UID="$(ls -nd "$ROOT_DIR" 2>/dev/null | awk '{print $3}')"
+# 以 root 运行（sudo ks）时，把生成物的属主还原给仓库主人，避免以后普通用户跑不了
+if [ "$AM_ROOT" = "1" ] && [ -n "$OWNER_UID" ]; then
+  trap 'chown -R "$OWNER_UID" "$STATE_DIR" "$BUILD_DIR" 2>/dev/null' EXIT
+fi
+
+[ -f "$ROOT_DIR/config.env" ] && . "$ROOT_DIR/config.env"
 
 # ---- 默认配置（可被 config.env 覆盖）----------------------------------------
 : "${NODE_ENDPOINTS:=}"                                  # IP[:PORT][, ...]
@@ -27,37 +34,50 @@ ok()  { printf '%s✔%s %s\n' "$C_OK" "$C_OFF" "$*"; }
 bad() { printf '%s✘%s %s\n' "$C_BAD" "$C_OFF" "$*"; }
 dim() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 
-# ---- 免密 sudo（白名单只有 pfctl / route）-----------------------------------
+# ---- 一次性授权：写 sudoers 白名单，之后永久免密 ------------------------------
 PFC=/sbin/pfctl
 RTC=/sbin/route
 SUDOERS_FILE=/etc/sudoers.d/mac-killswitch
 
-has_sudo() { sudo -n "$PFC" -s info >/dev/null 2>&1; }
-sf() { sudo -n "$PFC" "$@"; }
-sr() { sudo -n "$RTC" "$@"; }
-sudo_hint() { bad "还没授权：先跑一次  ks setup-sudo  （只弹这一次密码）"; }
+has_sudo() { if [ "$AM_ROOT" = "1" ]; then return 0; fi; sudo -n "$PFC" -s info >/dev/null 2>&1; }
+sf() { if [ "$AM_ROOT" = "1" ]; then "$PFC" "$@"; else sudo "$PFC" "$@"; fi; }   # 已授权→无感；sudo ks→直接
+sr() { if [ "$AM_ROOT" = "1" ]; then "$RTC" "$@"; else sudo "$RTC" "$@"; fi; }
 
-do_setup_sudo() {
+do_authorize() {
   local u tmp
   u="${SUDO_USER:-}"
-  [ -z "$u" ] || [ "$u" = "root" ] && u="$(ls -ld "$ROOT" 2>/dev/null | awk '{print $3}')"
+  if [ -z "$u" ] || [ "$u" = "root" ]; then
+    u="$(ls -ld "$ROOT_DIR" 2>/dev/null | awk '{print $3}')"   # 仓库目录属主
+  fi
   if [ -z "$u" ] || [ "$u" = "root" ] || ! id -u "$u" >/dev/null 2>&1; then
-    bad "无法确定目标用户（请用你自己的账号在终端里跑 setup-sudo）"; return 1
+    bad "确定不了用户名（请在你的终端里跑：ks）"; return 1
   fi
-  tmp="$(mktemp /tmp/mac-killswitch-sudo.XXXXXX)"
-  {
-    echo "# mac-killswitch: allow ${u} to manage pf/routes without password"
-    echo "${u} ALL=(root) NOPASSWD: ${PFC}, ${RTC}"
-  } > "$tmp"
-  say "→ 校验并写入 ${SUDOERS_FILE}（目标用户：${u}；需要输入一次密码）"
-  if sudo /bin/sh -c "/usr/sbin/visudo -cf '$tmp' >/dev/null 2>&1 && cp '$tmp' '$SUDOERS_FILE' && chmod 440 '$SUDOERS_FILE' && chown root:wheel '$SUDOERS_FILE'"; then
-    rm -f "$tmp"
-    has_sudo && ok "完成：以后 ks 不再需要密码" || bad "写入后仍未生效，请手动检查 ${SUDOERS_FILE}"
-  else
-    rm -f "$tmp"
-    sudo /bin/sh -c "rm -f '$SUDOERS_FILE'"
-    bad "写入失败（已清理残留文件）"
+  tmp="$(mktemp /tmp/mks-sudo.XXXXXX)"
+  printf '# mac-killswitch: passwordless pf/route for %s\n%s ALL=(root) NOPASSWD: %s, %s\n' \
+         "$u" "$u" "$PFC" "$RTC" > "$tmp"
+  say "一次性授权：只在这里输入一次密码，之后 ks 永久免密"
+  if ! sudo -v; then rm -f "$tmp"; bad "密码错误，未改动系统"; return 1; fi
+  if ! sudo /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; bad "规则校验失败，已放弃（系统未改动）"; return 1
   fi
+  if sudo /bin/sh -c "mkdir -p /etc/sudoers.d && cp '$tmp' '$SUDOERS_FILE' && chmod 440 '$SUDOERS_FILE' && chown root:wheel '$SUDOERS_FILE'"; then
+    rm -f "$tmp"
+    if sudo -n "$PFC" -s info >/dev/null 2>&1; then
+      ok "授权完成：以后 ks 不再问密码"
+      return 0
+    fi
+    bad "文件已写入但未生效，请看 ${SUDOERS_FILE}"; return 1
+  fi
+  rm -f "$tmp"; bad "安装失败，系统未改动"; return 1
+}
+
+ensure_sudo() {
+  [ "$AM_ROOT" = "1" ] && return 0
+  has_sudo && return 0
+  do_authorize && return 0
+  say "（退回到普通 sudo，下面还会问一次密码）"
+  sudo -v || { bad "无法获得管理员权限"; return 1; }
+  return 0
 }
 
 # ---- Clash (mihomo) 发现 ----------------------------------------------------
@@ -187,17 +207,14 @@ print_verify() {
 do_on() {
   local fw_only=0 tun f mode node
   [ "${1:-}" = "--fw-only" ] && fw_only=1
-  [ -n "$NODE_ENDPOINTS" ] || { bad "config.env 里没配 NODE_ENDPOINTS"; exit 1; }
-  if ! has_sudo; then
-    say "第一次使用，需要授权一次（照常输入你的密码即可，之后永不再问）"
-    do_setup_sudo || exit 1
-  fi
+  [ -n "$NODE_ENDPOINTS" ] || { bad "config.env 里没配 NODE_ENDPOINTS"; return 1; }
+  if ! ensure_sudo; then return 1; fi
 
   tun="$(tun_device)"
   f="$BUILD_DIR/pf.rules"
   gen_rules "$tun"
   say "→ 载入 pf 规则（隧道 ${tun}，节点 ${NODE_ENDPOINTS}）"
-  sf -f "$f" || { bad "pf 载入失败"; exit 1; }
+  sf -f "$f" || { bad "pf 载入失败"; return 1; }
   sf -E >/dev/null 2>&1
   date '+%Y-%m-%d %H:%M:%S' > "$STATE_DIR/on"
   ok "防火墙已生效：仅放行 隧道/局域网/节点/DNS，其余丢包"
@@ -220,14 +237,15 @@ do_on() {
   if [ -z "$(tunnel_egress)" ]; then
     bad "开启后隧道出口不通 → 自动还原（宁可没开，也不让你没网）"
     do_off
-    exit 1
+    return 1
   fi
   say ""
   dim "关掉：ks off   （或 sudo /sbin/pfctl -d；本机操作，不需要网络）"
 }
 
 do_off() {
-  if has_sudo; then sf -d >/dev/null 2>&1; else sudo "$PFC" -d >/dev/null 2>&1; fi
+  ensure_sudo || return 1
+  sf -d >/dev/null 2>&1
   rm -f "$STATE_DIR/on"
   ok "防火墙已关闭（pf 停用，恢复系统默认）"
   local saved=""
@@ -242,7 +260,7 @@ do_status() {
   say "TUN 设备  : $(tun_device)"
   say "节点白名单: ${NODE_ENDPOINTS:-（空）}"
   say "Clash 模式: $(clash_mode)"
-  has_sudo && dim "sudo      : 已免密授权" || dim "sudo      : 未授权（跑 ks setup-sudo）"
+  has_sudo && dim "sudo      : 已授权（缓存中）" || dim "sudo      : 下次开启时会要一次密码"
   if [ -f "$STATE_DIR/on" ]; then ok "kill switch 已开启（$(cat "$STATE_DIR/on")）"; else dim "kill switch 未开启"; fi
   say "出口 IP   : $(tunnel_egress)"
   say "默认路由  : $(route -n get default 2>/dev/null | awk '/gateway|interface/{printf "%s ", $2}')"
@@ -255,10 +273,10 @@ usage() {
 mac-killswitch — fail-closed 网络开关
 
   ks                    ← 直接敲这个，出菜单（推荐，不用记参数）
+  sudo ks               ← 也行：按管理员跑，不用任何授权配置
   ks on                 开启（防火墙 + Clash 全局）
   ks off                关闭并还原
   ks status / check     状态 / 自检
-  ks setup-sudo         可选：一次性免密授权
 EOF
 }
 
@@ -277,6 +295,7 @@ menu() {
     say "  2) 关闭   → 一切恢复原样（没网时用这个）"
     say "  3) 自检   → 看旁路是否真被丢包、隧道是否通"
     say "  4) 详情   → 状态原始信息"
+    if has_sudo; then say "  5) 授权   → 已生效（ks 免密）"; else say "  5) 授权   → 输一次密码，之后 ks 永久免密"; fi
     say "  q) 退出"
     printf ' 选择: '; read -r c
     case "$c" in
@@ -284,14 +303,14 @@ menu() {
       2) do_off;;
       3) do_check;;
       4) do_status;;
+      5) ensure_sudo;;
       q|Q|"") return;;
-      *) bad "请输入 1 / 2 / 3 / 4 / q";;
+      *) bad "请输入 1-5 或 q";;
     esac
   done
 }
 
 case "${1:-menu}" in
-  setup-sudo) do_setup_sudo;;
   on)     shift; do_on "$@";;
   off)    shift; do_off "$@";;
   status) do_status;;

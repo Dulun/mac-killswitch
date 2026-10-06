@@ -36,16 +36,18 @@ alias ks="$HOME/Documents/dev/mac-killswitch/killswitch.sh"
 
 ## 用法
 
+**只记一个命令：`ks`**（回车即出菜单，带状态、出口 IP、节点）
+
 ```bash
-ks                # 交互菜单
-ks on             # 开启：防火墙 + Clash 切全局模式（无任何 DIRECT 分流）
-ks on --fw-only   # 开启：只开防火墙，保留 Clash 规则分流
-ks off            # 关闭：pf 停用 + Clash 模式还原
-ks status         # 当前状态
-ks check          # 自检：绕过 TUN 的直连必须失败；隧道出口必须通
+ks                # 菜单：1 开启 / 2 关闭 / 3 自检 / 4 详情
+ks on             # 直接开启（防火墙 + Clash 切全局，无任何 DIRECT 分流）
+ks off            # 直接关闭（pf 停用 + Clash 模式还原）
+ks status / check # 状态 / 自检
 ```
 
-开启时脚本会自动跑一次自检（临时给 `1.1.1.1` 加一条走物理网卡的路由，验证它被丢包），并打印隧道出口 IP。
+首次（或 sudo 缓存过期后）开启时会问一次你的密码——标准 sudo 行为，密码缓存几分钟，期间再来回切不再问。
+
+开启时自动自检：给 `1.1.1.1` 临时加一条走物理网卡的路由 + 探测几个旁路目标，确认这些包被 `block drop`（读 pf 计数器验证），并打印隧道出口 IP。
 
 ## 关掉（没网时的救命命令）
 
