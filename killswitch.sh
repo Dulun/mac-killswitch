@@ -78,7 +78,7 @@ fw_enabled() {
 }
 
 fw_is_ours() {
-  pfq -s rules | grep -q '^pass quick on lo0 all$'
+  pfq -s rules | grep -q '^pass quick on lo0 all'
 }
 
 # ---- Clash 控制 API --------------------------------------------------------
@@ -103,7 +103,7 @@ clash_api() {
   fi
 }
 
-clash_cfg()      { clash_api GET /configs | jq -r "$1 // empty" 2>/dev/null; }
+clash_cfg()      { clash_api GET /configs | jq -r "$1 | if . == null then empty else . end" 2>/dev/null; }
 clash_mode()     { clash_cfg '.mode'; }
 clash_tun()      { clash_cfg '.tun.enable'; }
 clash_now()      { clash_api GET /proxies | jq -r --arg n "$1" '.proxies[$n].now // empty' 2>/dev/null; }
@@ -314,6 +314,7 @@ do_on() {
   fi
 
   ok "全链路通畅！出口 IP：${egress}"
+  printf '%s on user=%s tty=%s pid=%s node=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty 2>/dev/null||echo -)" "$$" "${node:-?}" >> "$STATE_DIR/ks.log"
   say "提示：当前为极致收紧模式，仅放行此单个节点；Clash 内测速其他节点报 Timeout 属正常现象。"
 }
 
@@ -338,6 +339,7 @@ do_off() {
   else
     ok "防火墙已关闭，系统网络完全恢复原样（正常直连与分流）"
   fi
+  printf '%s off user=%s tty=%s pid=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty 2>/dev/null||echo -)" "$$" >> "$STATE_DIR/ks.log"
 }
 
 do_status() {
@@ -353,7 +355,7 @@ do_status() {
   fi
 
   if [ -n "${SOCK:-}" ]; then
-    say "Clash 模式：$(clash_mode)   TUN 虚拟网卡：$(clash_tun) ($(tun_device))"
+    say "Clash 模式：$(clash_mode)   TUN 虚拟网卡：$(clash_tun)"
     say "当前选定节点：$(find_active_node)"
   else
     dim "Clash：未运行或未找到控制 Socket"
