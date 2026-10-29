@@ -17,8 +17,6 @@ BUILD_DIR="$ROOT_DIR/.build"
 STATE_DIR="$ROOT_DIR/.state"
 mkdir -p "$BUILD_DIR" "$STATE_DIR"
 TOKEN_FILE="$STATE_DIR/pf.tokens"
-WATCH_PID="$STATE_DIR/watcher.pid"
-WATCH_FLAG="$STATE_DIR/watch"
 # 兼容旧版单值文件
 [ -f "$STATE_DIR/pf.token" ] && { cat "$STATE_DIR/pf.token" >> "$TOKEN_FILE"; rm -f "$STATE_DIR/pf.token"; }
 
@@ -324,28 +322,6 @@ EOF
   printf '%s' "$ep_rules" >> "$f"
 }
 
-# 后台看门狗（一次性）：on 时锁的节点一旦被切走，立刻撤掉全部节点白名单 ——
-# 换节点 = 直接断网，必须 ks off → 选节点 → ks on 才能换出口。
-do_watch() {
-  local locked cur
-  locked="$(cat "$STATE_DIR/node" 2>/dev/null)"
-  [ -n "$locked" ] || return 0
-  while [ -f "$WATCH_FLAG" ]; do
-    ks_rules_loaded || break
-    cur="$(find_active_node)"
-    if [ -n "$cur" ] && [ "$cur" != "$locked" ]; then
-      # 白名单清空：旧节点、新节点都不放行，全部断网
-      NODE_ENDPOINTS="" gen_rules "$(tun_device)"
-      sf -f "$BUILD_DIR/pf.rules" >/dev/null 2>&1 && sf -F states >/dev/null 2>&1
-      printf '%s lockdown user=%s from=%s to=%s\n' "$(date '+%F %T')" "$(id -un)" "$locked" "$cur" >> "$STATE_DIR/ks.log"
-      rm -f "$WATCH_FLAG"
-      return 0
-    fi
-    sleep 2
-  done
-  return 0
-}
-
 do_on() {
   # ks on 永远不"失败"：每一步只看、只提示，能做多少做多少，退出码 0
   if ! ensure_sudo; then
@@ -432,24 +408,12 @@ do_on() {
   else
     warn "ks 没真正生效：规则不在内核（看上一条提示）"
   fi
-  # 7. 起看门狗：之后在 Clash 里换节点会自动撤掉白名单（不需要重新 ks on）
-  if [ "$loaded" = "1" ] && [ -n "$node" ]; then
-    [ -f "$WATCH_PID" ] && kill "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null
-    touch "$WATCH_FLAG"
-    nohup bash "$ROOT_DIR/killswitch.sh" __watch >/dev/null 2>&1 &
-    printf '%s' "$!" > "$WATCH_PID"
-    dim "      看门狗已启动（pid $!）：换了节点会撤掉全部白名单 = 断网（要换出口：ks off → 选节点 → ks on）"
-  fi
   dim "      联网自己验：curl -s https://ipinfo.io/json ；要撤：ks off ；彻底放开：ks pfoff"
   dim "      不通时看计数器：sudo pfctl -s rules -v（'block drop quick inet ... to <其它节点IP>' 在涨 = 有别的节点在尝试出网）"
   return 0
 }
 
 do_off() {
-  # 先停看门狗，免得它在 off 过程中又去改规则
-  rm -f "$WATCH_FLAG"
-  [ -f "$WATCH_PID" ] && kill "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null
-  rm -f "$WATCH_PID"
   # ks off 也永远不"失败"：能清多少清多少，退出码 0
   if ! ensure_sudo; then
     warn "没拿到管理员权限：什么也没改（这不是 ks 失败）"
@@ -490,9 +454,6 @@ do_status() {
     dim "      规则生成于：$(/usr/bin/stat -f '%Sm' "$BUILD_DIR/pf.rules" 2>/dev/null || echo 未生成过)"
   else
     dim "ks：未开启（ks 的规则不在内核）"
-  fi
-  if [ -f "$WATCH_FLAG" ] && [ -n "$(cat "$WATCH_PID" 2>/dev/null)" ] && kill -0 "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null; then
-    dim "      看门狗：运行中（pid $(cat "$WATCH_PID")）—— 换节点即撤白名单（断网）"
   fi
   if ks_ref_held; then
     dim "      ks 持有 pf 引用：token $(ks_tokens | paste -sd, -)"
@@ -578,7 +539,6 @@ case "${1:-menu}" in
   off)    shift; do_off "$@";;
   status) shift; do_status "$@";;
   pfoff|pf-off|unpf|alloff) shift; do_pfoff "$@";;
-  __watch) do_watch;;
   menu|"") menu;;
   -h|--help|help)
     say "用法: ks [on|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"

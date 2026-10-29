@@ -52,11 +52,11 @@ ks pfoff          # 终极恢复：pfctl -d，整个 pf 关掉（含系统/别�
 
 ### 换节点
 
-**不能边开边换。** `ks on` 起了一个一次性看门狗（2 秒轮询 `.state/watcher.pid`）：
+规则是**静态**的，没有任何后台进程：
 
-- 在 Clash 里换节点 → **立刻撤掉全部节点白名单**，新旧节点都不放行 = 断网；
-- 切回原节点也不会自动恢复；
-- 要换出口：`ks off` → 选好节点 → `ks on`。这一轮里旧节点自动进入"其它节点"封堵名单。
+- 在 Clash 里换到别的节点 → 那个节点的服务器 IP 已在封堵名单里 → **立刻断网**；
+- 切回锁定节点 → 它的 `IP:端口` 本来就在放行名单里 → **立刻恢复**；
+- 想换成另一个出口：`ks off` → 选节点 → `ks on`。新一轮里旧节点自动进入封堵名单，不会继续放行。
 
 ### 关掉（没网时的救命命令）
 
@@ -94,6 +94,10 @@ pass out quick inet proto udp from any to <锁定节点IP> port = <端口> keep 
 - **`pfctl -F states`**：清掉 `on` 之前就存在的连接状态。hysteria2 是长连接 QUIC（UDP `keep state`），不清会继续沿用老节点。
 - **`pfctl -E` + token 记账**：每次 `-E` 前后比对 `pfctl -s References`，新增 token 全部写入 `.state/pf.tokens`；`on` 开头 / `off` / `pfoff` 都会全量释放。实测 `on → on → off` 之后内核引用表里 0 个 `pfctl` token。
 - **只释放自己的引用**：`pfd`、InternetSharing 等别人的引用一概不动，`ks status` 里分开显示。
+
+## 无后台进程
+
+`ks` 是一次性脚本：装完规则就退出，不跑 daemon、不轮询 Clash。所有保证都由内核里的静态规则提供。
 
 ## 已知边界
 

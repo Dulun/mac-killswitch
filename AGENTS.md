@@ -9,12 +9,13 @@ macOS 上的 fail-closed 网络开关：用 `pf` 只放行「Clash TUN + 一个�
 2. **不碰系统 pf 的开关**：只 `-f` 自己的主规则集 + `-E`/`-X` 自己那一个引用。`pfd` / InternetSharing 的引用一律不动。
 3. **fail-closed**：宁可断网，不可放行。任何解析失败都退化成「不放行」，绝不放宽白名单。
 4. **`on` / `off` 永远退出 0**：所有前置条件降级成提示，不 `return 1`、不回滚、不联网自检。
-5. **单一出口**：白名单只能有一个节点；换节点必须 `off` → 选 → `on`，看门狗只负责"切走就断网"。
+5. **单一出口 + 无后台进程**：白名单只允许一个节点；不跑 daemon/轮询。切走靠"其它节点 IP 被封"直接断网，切回靠"锁定节点 IP 放行"直接恢复，换出口必须 `off` → 选 → `on`。
 
 ## 规则生成的三条铁律（都是踩过的坑）
 
 - **不要在 TUN 上按源地址过滤**。mihomo 自己的 DNS/DoH/QUIC 出站源地址就是 TUN 地址 `198.18.0.1`，按源封会连 DoH 一起封掉 → 表现为"有 fake-ip 但没网"。
 - **`198.18.0.0/16` 整段放行**（`tun` 上），应用流量与 mihomo 内部流量共用这条路径，无法区分。
+- **不要加后台守护进程**：换节点断网/切回恢复完全由静态规则表达（其它节点 IP 双向封 + 锁定节点放行）。
 - **"锁一个节点" = 封其它节点**：从 profile 读出所有节点 IP，扣掉锁定节点，逐个
   `block drop quick inet proto { tcp, udp } to/from <ip>`，**不限接口**（en0 / utun 都要拦；hysteria2 会换端口，只封 `ip:port` 会漏）。
 
@@ -26,14 +27,14 @@ macOS 上的 fail-closed 网络开关：用 `pf` 只放行「Clash TUN + 一个�
 ## 结构
 
 ```
-killswitch.sh            # 全部逻辑；do_on / do_off / do_status / do_pfoff / do_watch / gen_rules
+killswitch.sh            # 全部逻辑；do_on / do_off / do_status / do_pfoff / gen_rules
 lib/node_endpoints.py    # <profile> <节点名> → server:port；--all <profile> → 所有节点
 config.env               # 本地配置，不进 git（NODE_ENDPOINTS / DNS_SERVERS / DOH_HOSTS / LAN_CIDRS）
-.state/                  # node / pf.tokens / watcher.pid / watch / ks.log，不进 git
+.state/                  # node / pf.tokens / ks.log，不进 git
 .build/pf.rules          # 生成的规则，不进 git
 ```
 
-`.state/node` 记录锁定节点名，`ks status` 用它判断漂移；`.state/watch` 存在时看门狗才轮询。
+`.state/node` 记录锁定节点名，`ks status` 用它判断漂移；`.state/pf.tokens` 记录自己拿过的 pf 引用。
 
 ## 验证（改完必须跑）
 
