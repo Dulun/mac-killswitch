@@ -349,7 +349,15 @@ do_on() {
     # 不刷状态表，ks 生效前建立的节点会话会继续放行 —— "换了节点 hy2 还能出网"。
     sf -F states >/dev/null 2>&1 || warn "清空 pf 状态表失败（ks 生效前的老连接可能还能出去）"
 
-    # 只拿 ks 自己的引用（-E），token 存下来，off 时 -X 精确释放，不碰别人的引用
+    # 上次没关干净（token 文件被覆盖/丢失）时，先把自己留在引用表里的旧 token 释放掉，
+  # 否则 pf 会被一堆 pfctl 引用顶着，off 也关不掉
+  local oldtok
+  oldtok="$(ks_token)"
+  if [ -n "$oldtok" ] && pfq -s References -v | grep -q -- "$oldtok"; then
+    sf -X "$oldtok" >/dev/null 2>&1 || true
+  fi
+
+  # 只拿 ks 自己的引用（-E），token 存下来，off 时 -X 精确释放，不碰别人的引用
     # 注意：pfctl 的 "pf enabled / Token : …" 是打到 stderr 的，别把 stderr 丢掉
     local tokout tok
     tokout="$(sf -E 2>&1 || true)"
