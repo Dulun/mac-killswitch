@@ -85,7 +85,7 @@ App ──► utun（Clash TUN）──► mihomo ──► 节点 IP:PORT ─�
 - 换节点：**不能边开边换**。`ks on` 那一刻从 Clash 当前链路取到落地的节点，把它的 `server:port` 写死进白名单；之后你在 Clash 里换节点/换分组，新节点的连接会被 `block drop` 掉 = 直接断网（切回原节点才恢复）。要换出口：`ks off` → 选好节点 → `ks on`（节点 `server` 写域名时会走 DoH 解析成真实 IP）。
 - ks 载入规则后会**清空 pf 状态表**（`pfctl -F states`）：hysteria2 这类长连接 QUIC 会话不清会一直沿用 ks 生效前的老节点。
 - TUN 路径：`198.18.0.0/16`（fake-ip 段）整段放行 —— mihomo 自己的 DNS/DoH/节点连接都会从这里走，**不能按源地址区分**（按源封会把 DoH 一起封掉，表现就是"有 fake-ip 但没网"）。
-- 单节点锁定靠"封其它节点"实现：`ks on` 时从 profile 里读出所有节点的服务器 IP，扣掉锁定节点，`block drop quick on <tun> inet to { 其它节点IP }`，TUN 路径上也进不去。物理网卡侧仍是 `block drop all` + 只放行锁定节点 `ip:port`。
+- 单节点锁定靠"封其它节点"实现：`ks on` 时从 profile（`--all`）读出所有节点的服务器 IP，扣掉锁定节点，对每个 IP 在 TUN 上双向整条封（不限端口 —— hysteria2 的 QUIC 端口可能被端口跳跃换掉，只封 ip:port 会漏）。物理网卡侧仍是 `block drop all` + 只放行锁定节点 `ip:port`。
 - `route-exclude-address` 这类绕过 TUN 的地址也会被掐，需要的话加进 `ALLOW_PORTS_EXTRA`。
 - 重启后 pf 由系统自己决定（本机实测会被 `pfd` 为 vmnet 虚拟网络自行打开）；ks 只负责自己那份规则与引用，`ks status` 里分开显示。
 - 脚本执行需要 root（`sudo`），因此 `ks` 会提示输入密码。

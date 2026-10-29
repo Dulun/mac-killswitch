@@ -172,17 +172,17 @@ node_addr() {
   python3 "$ROOT_DIR/lib/node_endpoints.py" "$pf" "$1" 2>/dev/null | paste -sd, -
 }
 
-# profile 里所有节点的服务器 IP（去重；域名走 DoH 解析）
-node_all_ips() {
-  local pf out
+# profile 里所有节点的 server:port（去重；域名走 DoH 解析成 IP:port）
+node_all_endpoints() {
+  local pf
   pf="$(current_profile_file)"
   [ -n "$pf" ] && [ -f "$pf" ] || return 0
   python3 "$ROOT_DIR/lib/node_endpoints.py" --all "$pf" 2>/dev/null \
     | while IFS= read -r ep; do
-        local h="${ep%%:*}"
+        local h="${ep%%:*}" pt="${ep#*:}"
         case "$h" in
-          *[!0-9.]*) resolve_a "$h" ;;
-          *) printf '%s\n' "$h" ;;
+          *[!0-9.]*) resolve_a "$h" | sed "s/$/:${pt}/" ;;
+          *) printf '%s\n' "$ep" ;;
         esac
       done | sort -u
 }
@@ -233,7 +233,7 @@ gen_rules() {
   local f="$BUILD_DIR/pf.rules"
 
   # 锁定节点的端点：物理网卡上放行这一份
-  local ep_rules="" ep="" ip port locked_ips=" "
+  local ep_rules="" ep="" ip port
   IFS=',' read -ra ADDR <<< "$NODE_ENDPOINTS"
   for ep in "${ADDR[@]}"; do
     ep="$(printf '%s' "$ep" | tr -d ' ')"
@@ -241,20 +241,24 @@ gen_rules() {
     ip="${ep%%:*}"
     port="${ep#*:}"
     if [ -z "$port" ] || [ "$port" = "$ip" ]; then port="443"; fi
-    case "$locked_ips" in *" $ip "*) ;; *) locked_ips="${locked_ips}${ip} " ;; esac
     ep_rules="${ep_rules}pass out quick inet proto tcp from any to ${ip} port = ${port} flags S/SA keep state
 pass out quick inet proto udp from any to ${ip} port = ${port} keep state
 "
   done
 
-  # profile 里所有节点的服务器 IP，扣掉锁定节点 —— 这些在 TUN 路径上也必须丢，
-  # 否则 mihomo 把出站塞回自己的 TUN 时（源地址 198.18.0.1）换节点照样能出网。
-  local node_ips="" other_ips="" ep2 ipp
-  node_ips="$(node_all_ips)"
-  for ipp in $node_ips; do
-    case "$locked_ips" in *" $ipp "*) continue ;; esac
-    other_ips="${other_ips:+$other_ips,}${ipp}"
-  done
+  # profile 里其它节点的服务器 IP：TUN 路径上按 IP 整条封（不限端口 —— hysteria2 的
+  # QUIC 端口可能被端口跳跃/回退换掉，只封 ip:port 会漏）。
+  local other_rules="" ep2 ip2 seen=" "
+  while IFS= read -r ep2; do
+    [ -z "$ep2" ] && continue
+    ip2="${ep2%%:*}"
+    case "$seen" in *" ${ip2} "*) continue ;; esac
+    case ",${NODE_ENDPOINTS}," in *"${ip2}:"*) continue ;; esac
+    seen="${seen}${ip2} "
+    other_rules="${other_rules}block drop quick on ${tun} inet proto { tcp, udp } to ${ip2}
+block drop quick on ${tun} inet proto { tcp, udp } from ${ip2}
+"
+  done <<< "$(node_all_endpoints)"
 
   # DoH 放行（物理网卡）
   local h ips doh_rules=""
@@ -273,7 +277,7 @@ block drop all
 # 别的节点：连 TUN 路径也堵（mihomo 出站被 TUN 吞回时源地址是 198.18.0.1）
 EOF
 
-  [ -n "$other_ips" ] && printf 'block drop quick on %s inet to { %s }\n' "$tun" "$other_ips" >> "$f"
+  printf '%s' "$other_rules" >> "$f"
 
   cat >> "$f" <<EOF
 
