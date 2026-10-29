@@ -16,9 +16,30 @@ def extract_ports(segment: str) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def all_endpoints(path: str) -> list[str]:
+    """profile 里所有节点的 server:port（不解析域名）。"""
+    out: list[str] = []
+    lines = open(path, encoding="utf-8").read().splitlines()
+    for i, line in enumerate(lines):
+        if not re.match(r"\s*-\s*name\s*:", line):
+            continue
+        segment = line if "{" in line else "\n".join(lines[i : i + 15])
+        m = re.search(r'server:\s*["\']?([^,\s"\'}]+)', segment)
+        if not m:
+            continue
+        server = m.group(1).strip()
+        for p in extract_ports(segment):
+            out.append(f"{server}:{p}")
+    return out
+
+
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--all":
+        for ep in all_endpoints(sys.argv[2]):
+            print(ep)
+        return 0
     if len(sys.argv) < 3:
-        print("用法: node_endpoints.py <profile.yaml> <节点名>", file=sys.stderr)
+        print("用法: node_endpoints.py <profile.yaml> <节点名> | --all <profile.yaml>", file=sys.stderr)
         return 2
 
     path, target_node = sys.argv[1], sys.argv[2]

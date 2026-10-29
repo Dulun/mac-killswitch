@@ -2,17 +2,21 @@
 # mac-killswitch — macOS fail-closed 防火墙开关
 #
 # 核心逻辑：
-# 1. 开启时：自动将 Clash 切换为全局模式（global）并确保开启 TUN 虚拟网卡；
-#    从 Clash 提取当前选中节点的 IP 与端口；
+# 1. 开启时：前提是 Clash 已开 TUN（ks 不碰这个开关，没开就直接拒绝）；
+#    自动切换为全局模式（global），从 Clash 提取当前选中节点的 IP 与端口；
 #    配置内核 pf 防火墙：仅放行 本机回环、TUN 虚拟网卡、局域网私网、DNS 与该节点连接，其余物理网卡流量全部丢弃。
-# 2. 关闭时：彻底停用 pf 防火墙，将 Clash 恢复为规则分流模式（rule）。
-# 3. 状态判断：永远直接查询内核 pf 状态，不依赖任何本地标记文件，杜绝虚假状态。
+# 2. 关闭时：只清 ks 自己那份 —— 主规则集还原成系统自带 /etc/pf.conf，
+#    并用 -X 释放 ks 自己在 -E 时拿到的那个引用。macOS 自己（pfd/InternetSharing
+#    那套虚拟机网络）或别的软件持有的引用一律不动；系统 pf 开不开由它们自己决定。
+# 3. 状态判断：ks 自己的状态 = "规则是否在内核 + ks 的 token 是否还在引用表里"；
+#    系统 pf 状态与引用持有者分开显示，与 ks 无关。
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$ROOT_DIR/.build"
 STATE_DIR="$ROOT_DIR/.state"
 mkdir -p "$BUILD_DIR" "$STATE_DIR"
+TOKEN_FILE="$STATE_DIR/pf.token"
 
 AM_ROOT=0
 [ "$(id -u)" = "0" ] && AM_ROOT=1
@@ -27,7 +31,6 @@ fi
 : "${DNS_SERVERS:=114.114.114.114 223.5.5.5 223.6.6.6 119.29.29.29}"
 : "${DOH_HOSTS:=dns.alidns.com doh.pub}"
 : "${LAN_CIDRS:=192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 169.254.0.0/16 224.0.0.0/4}"
-: "${PROBE_IPS:=1.1.1.1 8.8.8.8}"
 
 C_OK=$'\033[32m'
 C_BAD=$'\033[31m'
@@ -40,6 +43,13 @@ ok()   { printf '%s✔%s %s\n' "$C_OK" "$C_OFF" "$*"; }
 bad()  { printf '%s✘%s %s\n' "$C_BAD" "$C_OFF" "$*"; }
 warn() { printf '%s⚠%s %s\n' "$C_WARN" "$C_OFF" "$*"; }
 dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+# 审计日志用：无 tty 时 tty(1) 会打印 "not a tty" 且带换行，会把日志行打断
+tty_id() {
+  local t
+  t="$(tty 2>/dev/null || true)"
+  case "$t" in /dev/*) printf '%s' "$t" ;; *) printf 'no-tty' ;; esac
+}
 
 # ---- 权限与 pf 命令封装 ----------------------------------------------------
 PFC=/sbin/pfctl
@@ -77,8 +87,25 @@ fw_enabled() {
   pfq -s info | grep -q 'Status: Enabled'
 }
 
-fw_is_ours() {
+# ks 自己那份规则是否正压在内核主规则集上（ks 生成的 pf.rules 特征行）
+ks_rules_loaded() {
   pfq -s rules | grep -q '^pass quick on lo0 all'
+}
+
+# ks 自己在 -E 时拿到的引用 token
+ks_token() {
+  [ -f "$TOKEN_FILE" ] && tr -d ' \n' < "$TOKEN_FILE"
+}
+
+ks_ref_held() {
+  local t
+  t="$(ks_token)"
+  [ -n "$t" ] && pfq -s References -v | grep -q -- "$t"
+}
+
+# pf 引用表：谁把 pf 开着（macOS 自己那套看这里）
+pf_holders() {
+  pfq -s References -v | awk '/^TOKENS:/{f=1;next} f && $1 ~ /^[0-9]+$/ {printf "%s[%s] token=%s (%s %s %s); ", $2, $1, $3, $4, $5, $6}'
 }
 
 # ---- Clash 控制 API --------------------------------------------------------
@@ -96,10 +123,11 @@ SOCK="$(find_sock || true)"
 clash_api() {
   [ -n "${SOCK:-}" ] || return 1
   local m="$1" p="$2" d="${3:-}"
+  # 本地 unix socket，3 秒还没响应就是 Clash 卡了；避免菜单被拖住
   if [ -n "$d" ]; then
-    curl -s --max-time 6 --unix-socket "$SOCK" -X "$m" -H 'Content-Type: application/json' -d "$d" "http://localhost$p"
+    curl -s --max-time 3 --unix-socket "$SOCK" -X "$m" -H 'Content-Type: application/json' -d "$d" "http://localhost$p"
   else
-    curl -s --max-time 6 --unix-socket "$SOCK" -X "$m" "http://localhost$p"
+    curl -s --max-time 3 --unix-socket "$SOCK" -X "$m" "http://localhost$p"
   fi
 }
 
@@ -107,16 +135,6 @@ clash_cfg()      { clash_api GET /configs | jq -r "$1 | if . == null then empty 
 clash_mode()     { clash_cfg '.mode'; }
 clash_tun()      { clash_cfg '.tun.enable'; }
 clash_now()      { clash_api GET /proxies | jq -r --arg n "$1" '.proxies[$n].now // empty' 2>/dev/null; }
-clash_set_mode() { clash_api PATCH /configs "{\"mode\":\"$1\"}" >/dev/null; }
-clash_select()   { clash_api PUT "/proxies/$1" "{\"name\":\"$2\"}" >/dev/null; }
-
-clash_ensure_tun() {
-  if [ "$(clash_tun)" != "true" ]; then
-    say "→ 自动开启 Clash TUN 虚拟网卡…"
-    clash_api PATCH /configs '{"tun":{"enable":true}}' >/dev/null
-    sleep 0.5
-  fi
-}
 
 tun_device() {
   local d
@@ -129,35 +147,51 @@ tun_device() {
   printf '%s' "${d:-utun1024}"
 }
 
-# 寻找当前生效的代理节点名称
+# 当前真正落地的节点名：从 GLOBAL 顺着分组链往下走，直到没有 .now 的那个（只读，不改 Clash）
 find_active_node() {
-  local n
-  n="$(clash_now GLOBAL)"
-  case "$n" in
-    ""|DIRECT|REJECT|REJECT-DROP)
-      # 如果 GLOBAL 未设置或指向直连，尝试从常见分组寻找
-      local grp
-      for grp in "🚀 节点选择" "良心云" "节点选择" "PROXY"; do
-        n="$(clash_now "$grp")"
-        case "$n" in ""|DIRECT|REJECT|REJECT-DROP) ;; *) break ;; esac
-      done
-      ;;
-  esac
-  case "$n" in
-    ""|DIRECT|REJECT|REJECT-DROP)
-      # 如果还是找不到，从所有代理中挑选第一个非直连节点
-      n="$(clash_api GET /proxies | jq -r '[.proxies[] | select(.type=="Vless" or .type=="Hysteria2" or .type=="Shadowsocks" or .type=="Trojan") | .name][0] // empty' 2>/dev/null)"
-      ;;
-  esac
-  printf '%s' "$n"
+  clash_api GET /proxies | jq -r '
+    def walk($n; $d):
+      if $d > 8 then empty
+      else .proxies[$n] as $p
+        | if $p == null then empty
+          elif ($p.now // "") == "" then $n
+          else walk($p.now; $d + 1)
+          end
+      end;
+    walk("GLOBAL"; 0)
+  ' 2>/dev/null
+}
+
+VERGE_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+
+# 节点的 server:port（只读 profile，不做 DNS，纯本地）
+node_addr() {
+  local pf
+  pf="$(current_profile_file)"
+  [ -n "$pf" ] && [ -f "$pf" ] || return 0
+  python3 "$ROOT_DIR/lib/node_endpoints.py" "$pf" "$1" 2>/dev/null | paste -sd, -
+}
+
+# profile 里所有节点的服务器 IP（去重；域名走 DoH 解析）
+node_all_ips() {
+  local pf out
+  pf="$(current_profile_file)"
+  [ -n "$pf" ] && [ -f "$pf" ] || return 0
+  python3 "$ROOT_DIR/lib/node_endpoints.py" --all "$pf" 2>/dev/null \
+    | while IFS= read -r ep; do
+        local h="${ep%%:*}"
+        case "$h" in
+          *[!0-9.]*) resolve_a "$h" ;;
+          *) printf '%s\n' "$h" ;;
+        esac
+      done | sort -u
 }
 
 # ---- 节点端点探测 -----------------------------------------------------------
 current_profile_file() {
-  local v_dir="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
   local cur
-  cur="$(grep -E '^current:' "${v_dir}/profiles.yaml" 2>/dev/null | awk '{print $2}')"
-  [ -n "$cur" ] && printf '%s' "${v_dir}/profiles/${cur}.yaml"
+  cur="$(grep -E '^current:' "${VERGE_DIR}/profiles.yaml" 2>/dev/null | awk '{print $2}')"
+  [ -n "$cur" ] && printf '%s' "${VERGE_DIR}/profiles/${cur}.yaml"
 }
 
 resolve_a() {
@@ -198,9 +232,36 @@ gen_rules() {
   local tun="$1"
   local f="$BUILD_DIR/pf.rules"
 
-  local doh_ips=""
+  # 锁定节点的端点：物理网卡上放行这一份
+  local ep_rules="" ep="" ip port locked_ips=" "
+  IFS=',' read -ra ADDR <<< "$NODE_ENDPOINTS"
+  for ep in "${ADDR[@]}"; do
+    ep="$(printf '%s' "$ep" | tr -d ' ')"
+    [ -z "$ep" ] && continue
+    ip="${ep%%:*}"
+    port="${ep#*:}"
+    if [ -z "$port" ] || [ "$port" = "$ip" ]; then port="443"; fi
+    case "$locked_ips" in *" $ip "*) ;; *) locked_ips="${locked_ips}${ip} " ;; esac
+    ep_rules="${ep_rules}pass out quick inet proto tcp from any to ${ip} port = ${port} flags S/SA keep state
+pass out quick inet proto udp from any to ${ip} port = ${port} keep state
+"
+  done
+
+  # profile 里所有节点的服务器 IP，扣掉锁定节点 —— 这些在 TUN 路径上也必须丢，
+  # 否则 mihomo 把出站塞回自己的 TUN 时（源地址 198.18.0.1）换节点照样能出网。
+  local node_ips="" other_ips="" ep2 ipp
+  node_ips="$(node_all_ips)"
+  for ipp in $node_ips; do
+    case "$locked_ips" in *" $ipp "*) continue ;; esac
+    other_ips="${other_ips:+$other_ips,}${ipp}"
+  done
+
+  # DoH 放行（物理网卡）
+  local h ips doh_rules=""
   for h in $DOH_HOSTS; do
-    doh_ips="$doh_ips $(resolve_a "$h" | tr '\n' ' ')"
+    ips="$(resolve_a "$h" | paste -sd, -)"
+    [ -n "$ips" ] && doh_rules="${doh_rules}pass out quick proto tcp to { ${ips} } port 443
+"
   done
 
   cat > "$f" <<EOF
@@ -209,178 +270,237 @@ set block-policy drop
 
 block drop all
 
+# 别的节点：连 TUN 路径也堵（mihomo 出站被 TUN 吞回时源地址是 198.18.0.1）
+EOF
+
+  [ -n "$other_ips" ] && printf 'block drop quick on %s inet to { %s }\n' "$tun" "$other_ips" >> "$f"
+
+  cat >> "$f" <<EOF
+
+# TUN / fake-ip 段全部放行：mihomo 自己的 DNS、DoH、节点连接都从这里走，不能按源地址区分
 pass quick on lo0 all
+pass quick on ${tun} inet from 198.18.0.0/16
 pass quick on ${tun} all
 pass quick from any to { ${LAN_CIDRS// /,} }
 pass quick proto udp from any port 68 to any port 67
 pass out quick proto { tcp, udp } to { ${DNS_SERVERS// /,} } port { 53, 853 }
 EOF
 
-  if [ -n "$doh_ips" ]; then
-    local doh_clean
-    doh_clean="$(echo "$doh_ips" | tr -s ' ' ',')"
-    cat >> "$f" <<EOF
-pass out quick proto tcp to { ${doh_clean#,} } port 443
-EOF
-  fi
-
-  # 放行唯一的当前节点端点 (IP:PORT)
-  IFS=',' read -ra ADDR <<< "$NODE_ENDPOINTS"
-  for ep in "${ADDR[@]}"; do
-    ep="$(echo "$ep" | tr -d ' ')"
-    [ -z "$ep" ] && continue
-    local ip="${ep%%:*}"
-    local port="${ep#*:}"
-    [ -z "$port" ] || [ "$port" = "$ip" ] && port="443"
-    cat >> "$f" <<EOF
-pass out quick inet proto tcp from any to $ip port = $port flags S/SA keep state
-pass out quick inet proto udp from any to $ip port = $port keep state
-EOF
-  done
+  printf '%s' "$doh_rules" >> "$f"
+  printf '%s' "$ep_rules" >> "$f"
 }
 
-tunnel_egress() {
-  curl -s --max-time 6 https://ipinfo.io/json 2>/dev/null | jq -r '.ip + " " + .city + " " + .country' 2>/dev/null || true
-}
-
-block_packets() {
-  pfq -s rules -v 2>/dev/null | awk '/block drop quick all/ {getline; print $2}' | tr -d ' '
-}
-
-# ---- 核心动作 ---------------------------------------------------------------
 do_on() {
-  ensure_sudo || return 1
+  # ks on 永远不"失败"：每一步只看、只提示，能做多少做多少，退出码 0
+  if ! ensure_sudo; then
+    warn "没拿到管理员权限：pf 一点没动（这不是 ks 失败）"
+    return 0
+  fi
 
   if [ -z "${SOCK:-}" ]; then
-    bad "未找到 Clash 控制 Socket（请先启动 Clash Verge）"
-    return 1
+    warn "没找到 Clash 控制 socket（Clash 没跑？）：读不到节点，白名单只能用 config.env 的 NODE_ENDPOINTS"
   fi
 
-  # 1. 自动启用 TUN 虚拟网卡
-  clash_ensure_tun
+  # 1. TUN 归你自己管：没开也照装规则，等你打开才通
+  if [ "$(clash_tun)" != "true" ]; then
+    warn "Clash TUN 没开：规则照样装，TUN 打开前是断网状态（ks 不碰这个开关）"
+  fi
   local tun
   tun="$(tun_device)"
 
-  # 2. 自动切换 Clash 为全局模式 (global)
+  # 2. 模式只提示，不切换
   local current_mode
   current_mode="$(clash_mode)"
-  if [ "$current_mode" != "global" ]; then
-    printf '%s' "$current_mode" > "$STATE_DIR/mode.saved"
-    clash_set_mode "global"
-    ok "已自动将 Clash 切换为全局模式（原模式: ${current_mode}）"
-  fi
+  [ "$current_mode" = "global" ] || warn "Clash 现在是 ${current_mode} 模式（不是 global）：分流到 DIRECT 的流量会被一起丢，自己决定"
 
-  # 3. 确定当前选中的节点并确保 GLOBAL 指向它
+  # 3. 读当前真正落地的节点（顺分组链走，不改 Clash）；读不到就继续
   local node
   node="$(find_active_node)"
-  if [ -z "$node" ]; then
-    bad "无法在 Clash 中找到有效可用节点，请在 Clash 中选择一个节点后再开"
-    return 1
-  fi
-  clash_select GLOBAL "$node"
-  ok "当前出网节点：${node}"
+  case "$node" in
+    ""|DIRECT|REJECT|REJECT-DROP)
+      warn "没读到落地节点（当前出口：${node:-空}）：白名单里不会有任何节点"
+      node=""
+      ;;
+    *) ok "当前出网节点：${node}" ;;
+  esac
 
-  # 4. 获取节点白名单端点 (IP:PORT)
-  if [ -z "$NODE_ENDPOINTS" ]; then
+  # 4. 节点端点 (IP:PORT)：读不到就提示，不拦
+  if [ -z "$NODE_ENDPOINTS" ] && [ -n "$node" ]; then
     NODE_ENDPOINTS="$(detect_endpoints "$node")"
-    if [ -z "$NODE_ENDPOINTS" ]; then
-      bad "自动探测节点 ${node} 的服务器 IP 失败，请在 config.env 手动填写 NODE_ENDPOINTS"
-      return 1
-    fi
   fi
-  ok "放行节点端点：${NODE_ENDPOINTS}"
+  if [ -n "$NODE_ENDPOINTS" ]; then
+    ok "放行节点端点：${NODE_ENDPOINTS}"
+  else
+    warn "没有节点端点：装上就是全断（要放行就把 IP:PORT 填进 config.env 的 NODE_ENDPOINTS）"
+  fi
 
-  # 5. 生成并载入防火墙规则
+  # 5. 生成并载入规则（占系统主规则集，ks off 时还原 /etc/pf.conf）
   gen_rules "$tun"
-  say "→ 载入内核 pf 规则（放行 TUN 虚拟网卡: ${tun} 与节点: ${NODE_ENDPOINTS}）…"
-  sf -f "$BUILD_DIR/pf.rules" || { bad "pf 规则载入失败"; return 1; }
-  sf -E >/dev/null 2>&1 || true
+  say "→ 载入内核 pf 规则（TUN: ${tun}，节点端点: ${NODE_ENDPOINTS:-无}）…"
+  local loaded=0
+  if sf -f "$BUILD_DIR/pf.rules"; then
+    loaded=1
+    # 规则载入不清已有状态：hysteria2 是长连接 QUIC（UDP keep state），
+    # 不刷状态表，ks 生效前建立的节点会话会继续放行 —— "换了节点 hy2 还能出网"。
+    sf -F states >/dev/null 2>&1 || warn "清空 pf 状态表失败（ks 生效前的老连接可能还能出去）"
 
-  if ! fw_enabled; then
-    bad "防火墙未能成功启用"
-    return 1
+    # 只拿 ks 自己的引用（-E），token 存下来，off 时 -X 精确释放，不碰别人的引用
+    # 注意：pfctl 的 "pf enabled / Token : …" 是打到 stderr 的，别把 stderr 丢掉
+    local tokout tok
+    tokout="$(sf -E 2>&1 || true)"
+    tok="$(printf '%s\n' "$tokout" | sed -n 's/^Token[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)$/\1/p' | tail -1)"
+    if [ -n "$tok" ]; then
+      printf '%s' "$tok" > "$TOKEN_FILE"
+    else
+      warn "没拿到 pf 引用 token（-E 输出异常），off 时可能释放不掉 ks 自己的引用"
+    fi
+  else
+    warn "pf 规则没装上（规则文件在 ${BUILD_DIR}/pf.rules）：内核一点没改"
   fi
-  ok "防火墙已在内核生效：物理网卡旁路直连全部掐断，仅允许经由 Clash TUN"
 
-  # 6. 安全回滚机制：实测隧道是否连通互联网
-  say "→ 正在验证隧道连通性…"
-  local egress
-  egress="$(tunnel_egress)"
-  if [ -z "$egress" ]; then
-    bad "开启后隧道无法连接互联网！"
-    warn "触发安全回滚：正在还原系统并关闭防火墙，避免断网…"
-    do_off
-    return 1
+  fw_enabled || warn "pf 当前不是 Enabled（没有持有引用的进程；规则文件已生成）"
+
+  # 6. 不验证联网（自己验）：记节点、写日志、收工
+  [ -n "$node" ] && printf '%s' "$node" > "$STATE_DIR/node"
+  printf '%s on user=%s tty=%s pid=%s node=%s ref=%s loaded=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty_id)" "$$" "${node:-?}" "${tok:-none}" "$loaded" >> "$STATE_DIR/ks.log"
+
+  if [ "$loaded" = "1" ] && ks_rules_loaded; then
+    ok "ks 已开启：出口锁定 ${node:-未读到}（${NODE_ENDPOINTS:-无端点}）"
+    say "      之后在 Clash 里换节点 = 新节点没在白名单里 = 断网；要换出口：ks off → 选好节点 → ks on。"
+  else
+    warn "ks 没真正生效：规则不在内核（看上一条提示）"
   fi
-
-  ok "全链路通畅！出口 IP：${egress}"
-  printf '%s on user=%s tty=%s pid=%s node=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty 2>/dev/null||echo -)" "$$" "${node:-?}" >> "$STATE_DIR/ks.log"
-  say "提示：当前为极致收紧模式，仅放行此单个节点；Clash 内测速其他节点报 Timeout 属正常现象。"
+  dim "      联网自己验：curl -s https://ipinfo.io/json ；要撤：ks off ；彻底放开：ks pfoff"
+  dim "      不通时看计数器：sudo pfctl -s rules -v（'block drop quick on ${tun} from <tun地址>' 在涨 = mihomo 出站被 TUN 吞回且不在白名单）"
+  return 0
 }
 
 do_off() {
-  ensure_sudo || return 1
-  say "→ 正在停用内核 pf 防火墙…"
-  sf -d >/dev/null 2>&1 || true
-
-  # 恢复 Clash 为规则模式
-  if [ -n "${SOCK:-}" ]; then
-    local saved="rule"
-    if [ -f "$STATE_DIR/mode.saved" ]; then
-      saved="$(cat "$STATE_DIR/mode.saved" 2>/dev/null || echo "rule")"
-      rm -f "$STATE_DIR/mode.saved"
-    fi
-    clash_set_mode "$saved"
-    ok "Clash 模式已恢复为：${saved}"
+  # ks off 也永远不"失败"：能清多少清多少，退出码 0
+  if ! ensure_sudo; then
+    warn "没拿到管理员权限：什么也没改（这不是 ks 失败）"
+    return 0
   fi
 
-  if fw_enabled; then
-    warn "防火墙状态仍为开启，请检查是否有外部进程控制 pf"
+  # 1. 只清 ks 自己那份规则：主规则集还原成系统自带的 /etc/pf.conf。
+  #    若 ks 的规则不在内核（别人/系统自己在用），一律不碰。
+  if ks_rules_loaded; then
+    say "→ 清除 ks 的规则（主规则集还原成系统自带 /etc/pf.conf）…"
+    sf -f /etc/pf.conf >/dev/null 2>&1 || warn "系统规则集还原失败"
   else
-    ok "防火墙已关闭，系统网络完全恢复原样（正常直连与分流）"
+    dim "ks 的规则不在内核，无需清除"
   fi
-  printf '%s off user=%s tty=%s pid=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty 2>/dev/null||echo -)" "$$" >> "$STATE_DIR/ks.log"
+
+  # 2. 只释放 ks 自己在 -E 时拿到的那个引用；系统（pfd 等）或别家软件的引用一概不动
+  local t out
+  t="$(ks_token)"
+  if [ -n "$t" ]; then
+    out="$(sf -X "$t" 2>&1 || true)"
+    if ks_ref_held; then
+      warn "释放 ks 引用没成功（${out##*$'\n'}）；token ${t} 还留在内核引用表里，已保留记录可重试"
+    else
+      rm -f "$TOKEN_FILE"
+      case "$out" in
+        *successful*) ok "已释放 ks 自己的 pf 引用（token ${t}）" ;;
+        *)            dim "ks 的 token ${t} 已不在内核引用表里，本地记录已清掉" ;;
+      esac
+      case "$out" in *"still enabled"*) dim "pf 仍由其他引用保持开启（那是别人的事）" ;; esac
+    fi
+  else
+    dim "ks 没有持有 pf 引用，无需释放"
+  fi
+
+  # 3. Clash 一律不动：模式、TUN、节点全由你自己管，ks off 只管防火墙
+  # 4. 如实汇报系统 pf —— 那是 macOS 自己的事，ks 不去关它
+  if fw_enabled; then
+    warn "系统 pf 仍为开启（$(pf_holders)由 macOS/其他软件自己管理），ks 只清了自己那份"
+  else
+    ok "系统 pf 也已关闭（内核里没有其他引用）"
+  fi
+  printf '%s off user=%s tty=%s pid=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty_id)" "$$" >> "$STATE_DIR/ks.log"
 }
 
 do_status() {
   say "====================  mac-killswitch 状态  ===================="
-  if fw_enabled; then
-    if fw_is_ours; then
-      ok "防火墙状态：已开启（fail-closed 保护中，旁路完全拦截）"
-    else
-      warn "防火墙状态：已开启（非 mac-killswitch 规则，由其他软件接管）"
-    fi
+  # —— ks 自己 ——
+  if ks_rules_loaded; then
+    ok "ks：已开启（规则压在内核主规则集上，fail-closed 保护中）"
+    dim "      规则生成于：$(/usr/bin/stat -f '%Sm' "$BUILD_DIR/pf.rules" 2>/dev/null || echo 未生成过)"
   else
-    dim "防火墙状态：未开启（系统默认网络，无任何阻断）"
+    dim "ks：未开启（ks 的规则不在内核）"
+  fi
+  if ks_ref_held; then
+    dim "      ks 持有 pf 引用：token $(ks_token)"
+  elif [ -n "$(ks_token)" ]; then
+    dim "      ks 留有旧 token $(ks_token)，但内核引用表里已没有它（下次 off 会清掉）"
   fi
 
+  # —— 系统 pf（macOS/其他软件自己那套，与 ks 无关）——
+  local h
+  h="$(pf_holders)"
+  h="${h%; }"
+  if fw_enabled; then
+    say "系统 pf：已开启（引用持有者：${h:-未列出}）"
+  else
+    say "系统 pf：未开启"
+  fi
+  dim "         $(pfq -s info | grep -o 'Status: .*')"
+
   if [ -n "${SOCK:-}" ]; then
+    local cur_node locked_node cur_addr
+    cur_node="$(find_active_node)"
+    cur_addr="$(node_addr "$cur_node")"
     say "Clash 模式：$(clash_mode)   TUN 虚拟网卡：$(clash_tun)"
-    say "当前选定节点：$(find_active_node)"
+    say "当前选定节点：${cur_node}${cur_addr:+（${cur_addr}）}"
+    # ks 只锁「on 那一刻」的节点端点；之后换节点，新节点的包会被丢（fail-closed），不会跟着切
+    if ks_rules_loaded && [ -f "$STATE_DIR/node" ]; then
+      locked_node="$(cat "$STATE_DIR/node" 2>/dev/null)"
+      if [ "$cur_node" != "$locked_node" ]; then
+        bad "节点已从 ${locked_node} 切到 ${cur_node}：白名单里只有前者，现在出网应全部被丢（要换出口：ks off → 选节点 → ks on）"
+      else
+        dim "      白名单锁定：${locked_node}（换到别的节点会断网）"
+      fi
+    fi
   else
     dim "Clash：未运行或未找到控制 Socket"
   fi
 
-  local egress
-  egress="$(tunnel_egress)"
-  say "出口 IP：${egress:-（无法获取）}"
   say "=============================================================="
+}
+
+# 终极恢复：把 pf 整个关掉（系统/别人持有的引用一起压掉），不是 ks off
+do_pfoff() {
+  if ! ensure_sudo; then
+    warn "没拿到管理员权限：pf 没动"
+    return 0
+  fi
+  say "→ 关闭 pf（pfctl -d：所有引用一起失效，内核不再做过包过滤）…"
+  sf -d 2>&1 | sed 's/^/    /'
+  if fw_enabled; then
+    warn "pf 还是 Enabled（可能被 pfd 立刻拉回来了）"
+  else
+    ok "pf 已关闭：现在是完全裸奔状态，要恢复过滤用 ks on 或重启 pf"
+  fi
+  printf '%s pfoff user=%s tty=%s pid=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty_id)" "$$" >> "$STATE_DIR/ks.log"
+  return 0
 }
 
 menu() {
   while :; do
     say ""
-    do_status
-    say "  1) 开启   → 自动开 TUN + 设全局 + 放行该节点 + 阻断全部旁路"
-    say "  2) 关闭   → 关闭防火墙 + 恢复 Clash 规则模式"
+    do_status fast
+    say "  1) 开启   → 设全局 + 锁当前节点 + 阻断全部旁路（TUN 需你先在 Verge 里开着）"
+    say "  2) 关闭   → 清掉 ks 自己的规则与引用 + 恢复 Clash 规则模式（不动系统 pf）"
     say "  3) 状态   → 重新检查并刷新当前状态"
+    say "  4) 关掉所有 pf → 终极恢复（连系统/别人的引用一起压掉，纯裸奔）"
     say "  q) 退出菜单"
-    printf "请选择 [1/2/3/q]: "
+    printf "请选择 [1/2/3/4/q]: "
     read -r c
     case "$c" in
       1) do_on;;
       2) do_off;;
       3) do_status;;
+      4) do_pfoff;;
       q|Q) break;;
       *) say "无效输入";;
     esac
@@ -390,14 +510,15 @@ menu() {
 case "${1:-menu}" in
   on)     shift; do_on "$@";;
   off)    shift; do_off "$@";;
-  status) do_status;;
+  status) shift; do_status "$@";;
+  pfoff|pf-off|unpf|alloff) shift; do_pfoff "$@";;
   menu|"") menu;;
   -h|--help|help)
-    say "用法: ks [on|off|status|menu]"
+    say "用法: ks [on|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
     ;;
   *)
     say "未知命令: $1"
-    say "用法: ks [on|off|status|menu]"
+    say "用法: ks [on|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
     exit 1
     ;;
 esac
