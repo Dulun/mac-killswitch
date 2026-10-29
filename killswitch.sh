@@ -16,7 +16,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$ROOT_DIR/.build"
 STATE_DIR="$ROOT_DIR/.state"
 mkdir -p "$BUILD_DIR" "$STATE_DIR"
-TOKEN_FILE="$STATE_DIR/pf.token"
+TOKEN_FILE="$STATE_DIR/pf.tokens"
+WATCH_PID="$STATE_DIR/watcher.pid"
+WATCH_FLAG="$STATE_DIR/watch"
+# 兼容旧版单值文件
+[ -f "$STATE_DIR/pf.token" ] && { cat "$STATE_DIR/pf.token" >> "$TOKEN_FILE"; rm -f "$STATE_DIR/pf.token"; }
 
 AM_ROOT=0
 [ "$(id -u)" = "0" ] && AM_ROOT=1
@@ -93,14 +97,38 @@ ks_rules_loaded() {
 }
 
 # ks 自己在 -E 时拿到的引用 token
-ks_token() {
-  [ -f "$TOKEN_FILE" ] && tr -d ' \n' < "$TOKEN_FILE"
+# ks 拿过的所有 pf 引用（每行一个，历史遗留的也都在，避免 -E 后漏记）
+ks_tokens() {
+  [ -f "$TOKEN_FILE" ] || return 0
+  tr -s ' \n' '\n' < "$TOKEN_FILE" | grep -E '^[0-9]+$' | sort -u
 }
 
 ks_ref_held() {
   local t
-  t="$(ks_token)"
-  [ -n "$t" ] && pfq -s References -v | grep -q -- "$t"
+  while IFS= read -r t; do
+    [ -n "$t" ] && pfq -s References -v | grep -q -- "$t" && return 0
+  done < <(ks_tokens)
+  return 1
+}
+
+# 释放 ks 自己拿过的引用（系统/别家软件的一概不动）；释放不掉的留在文件里下次重试
+release_own_tokens() {
+  local t out keep=""
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    if pfq -s References -v | grep -q -- "$t"; then
+      out="$(sf -X "$t" 2>&1 || true)"
+      if pfq -s References -v | grep -q -- "$t"; then
+        warn "释放 pf 引用失败：token ${t}（${out##*$'\n'}），已保留记录下次再试"
+        keep="${keep}${t}"$'\n'
+      else
+        ok "已释放 pf 引用 token ${t}"
+      fi
+    else
+      dim "token ${t} 已不在内核引用表里，清掉本地记录"
+    fi
+  done < <(ks_tokens)
+  printf '%s' "$keep" > "$TOKEN_FILE"
 }
 
 # pf 引用表：谁把 pf 开着（macOS 自己那套看这里）
@@ -296,6 +324,28 @@ EOF
   printf '%s' "$ep_rules" >> "$f"
 }
 
+# 后台看门狗（一次性）：on 时锁的节点一旦被切走，立刻撤掉全部节点白名单 ——
+# 换节点 = 直接断网，必须 ks off → 选节点 → ks on 才能换出口。
+do_watch() {
+  local locked cur
+  locked="$(cat "$STATE_DIR/node" 2>/dev/null)"
+  [ -n "$locked" ] || return 0
+  while [ -f "$WATCH_FLAG" ]; do
+    ks_rules_loaded || break
+    cur="$(find_active_node)"
+    if [ -n "$cur" ] && [ "$cur" != "$locked" ]; then
+      # 白名单清空：旧节点、新节点都不放行，全部断网
+      NODE_ENDPOINTS="" gen_rules "$(tun_device)"
+      sf -f "$BUILD_DIR/pf.rules" >/dev/null 2>&1 && sf -F states >/dev/null 2>&1
+      printf '%s lockdown user=%s from=%s to=%s\n' "$(date '+%F %T')" "$(id -un)" "$locked" "$cur" >> "$STATE_DIR/ks.log"
+      rm -f "$WATCH_FLAG"
+      return 0
+    fi
+    sleep 2
+  done
+  return 0
+}
+
 do_on() {
   # ks on 永远不"失败"：每一步只看、只提示，能做多少做多少，退出码 0
   if ! ensure_sudo; then
@@ -352,22 +402,20 @@ do_on() {
 
     # 上次没关干净（token 文件被覆盖/丢失）时，先把自己留在引用表里的旧 token 释放掉，
   # 否则 pf 会被一堆 pfctl 引用顶着，off 也关不掉
-  local oldtok
-  oldtok="$(ks_token)"
-  if [ -n "$oldtok" ] && pfq -s References -v | grep -q -- "$oldtok"; then
-    sf -X "$oldtok" >/dev/null 2>&1 || true
-  fi
+  release_own_tokens
 
   # 只拿 ks 自己的引用（-E），token 存下来，off 时 -X 精确释放，不碰别人的引用
     # 注意：pfctl 的 "pf enabled / Token : …" 是打到 stderr 的，别把 stderr 丢掉
-    local tokout tok
+    # 记账：-E 前后比对引用表，新增的 token 一律记下来（不依赖 -E 的输出格式）
+    local before after tokout tok
+    before="$(pfq -s References -v | awk '$1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {print $3}' | sort -u)"
     tokout="$(sf -E 2>&1 || true)"
+    after="$(pfq -s References -v | awk '$1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {print $3}' | sort -u)"
     tok="$(printf '%s\n' "$tokout" | sed -n 's/^Token[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)$/\1/p' | tail -1)"
-    if [ -n "$tok" ]; then
-      printf '%s' "$tok" > "$TOKEN_FILE"
-    else
-      warn "没拿到 pf 引用 token（-E 输出异常），off 时可能释放不掉 ks 自己的引用"
-    fi
+    { ks_tokens; printf '%s\n' "$tok"; comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after"); } \
+      | grep -E '^[0-9]+$' | sort -u > "$TOKEN_FILE"
+    tok="$(ks_tokens | tail -1)"
+    [ -n "$tok" ] || warn "没拿到 pf 引用 token（-E 输出异常且引用表无变化）"
   else
     warn "pf 规则没装上（规则文件在 ${BUILD_DIR}/pf.rules）：内核一点没改"
   fi
@@ -384,12 +432,24 @@ do_on() {
   else
     warn "ks 没真正生效：规则不在内核（看上一条提示）"
   fi
+  # 7. 起看门狗：之后在 Clash 里换节点会自动撤掉白名单（不需要重新 ks on）
+  if [ "$loaded" = "1" ] && [ -n "$node" ]; then
+    [ -f "$WATCH_PID" ] && kill "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null
+    touch "$WATCH_FLAG"
+    nohup bash "$ROOT_DIR/killswitch.sh" __watch >/dev/null 2>&1 &
+    printf '%s' "$!" > "$WATCH_PID"
+    dim "      看门狗已启动（pid $!）：换了节点会撤掉全部白名单 = 断网（要换出口：ks off → 选节点 → ks on）"
+  fi
   dim "      联网自己验：curl -s https://ipinfo.io/json ；要撤：ks off ；彻底放开：ks pfoff"
   dim "      不通时看计数器：sudo pfctl -s rules -v（'block drop quick inet ... to <其它节点IP>' 在涨 = 有别的节点在尝试出网）"
   return 0
 }
 
 do_off() {
+  # 先停看门狗，免得它在 off 过程中又去改规则
+  rm -f "$WATCH_FLAG"
+  [ -f "$WATCH_PID" ] && kill "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null
+  rm -f "$WATCH_PID"
   # ks off 也永远不"失败"：能清多少清多少，退出码 0
   if ! ensure_sudo; then
     warn "没拿到管理员权限：什么也没改（这不是 ks 失败）"
@@ -405,24 +465,13 @@ do_off() {
     dim "ks 的规则不在内核，无需清除"
   fi
 
-  # 2. 只释放 ks 自己在 -E 时拿到的那个引用；系统（pfd 等）或别家软件的引用一概不动
-  local t out
-  t="$(ks_token)"
-  if [ -n "$t" ]; then
-    out="$(sf -X "$t" 2>&1 || true)"
-    if ks_ref_held; then
-      warn "释放 ks 引用没成功（${out##*$'\n'}）；token ${t} 还留在内核引用表里，已保留记录可重试"
-    else
-      rm -f "$TOKEN_FILE"
-      case "$out" in
-        *successful*) ok "已释放 ks 自己的 pf 引用（token ${t}）" ;;
-        *)            dim "ks 的 token ${t} 已不在内核引用表里，本地记录已清掉" ;;
-      esac
-      case "$out" in *"still enabled"*) dim "pf 仍由其他引用保持开启（那是别人的事）" ;; esac
-    fi
+  # 2. 只释放 ks 自己拿过的引用（可能有多个：反复 on 时 -E 每次都拿一个）
+  if ks_tokens | grep -q .; then
+    release_own_tokens
   else
     dim "ks 没有持有 pf 引用，无需释放"
   fi
+  case "$(sf -s info 2>/dev/null)" in *"still enabled"*) dim "pf 仍由其他引用保持开启（那是别人的事）" ;; esac
 
   # 3. Clash 一律不动（模式/TUN/节点由你自己管）；只如实汇报系统 pf —— 那是 macOS 自己的事
   if fw_enabled; then
@@ -442,10 +491,13 @@ do_status() {
   else
     dim "ks：未开启（ks 的规则不在内核）"
   fi
+  if [ -f "$WATCH_FLAG" ] && [ -n "$(cat "$WATCH_PID" 2>/dev/null)" ] && kill -0 "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null; then
+    dim "      看门狗：运行中（pid $(cat "$WATCH_PID")）—— 换节点即撤白名单（断网）"
+  fi
   if ks_ref_held; then
-    dim "      ks 持有 pf 引用：token $(ks_token)"
-  elif [ -n "$(ks_token)" ]; then
-    dim "      ks 留有旧 token $(ks_token)，但内核引用表里已没有它（下次 off 会清掉）"
+    dim "      ks 持有 pf 引用：token $(ks_tokens | paste -sd, -)"
+  elif ks_tokens | grep -q .; then
+    dim "      ks 留有旧 token $(ks_tokens | paste -sd, -)，但内核引用表里已没有它（下次 off 会清掉）"
   fi
 
   # —— 系统 pf（macOS/其他软件自己那套，与 ks 无关）——
@@ -487,6 +539,7 @@ do_pfoff() {
     warn "没拿到管理员权限：pf 没动"
     return 0
   fi
+  ks_tokens | grep -q . && release_own_tokens
   say "→ 关闭 pf（pfctl -d：所有引用一起失效，内核不再做过包过滤）…"
   sf -d 2>&1 | sed 's/^/    /'
   if fw_enabled; then
@@ -525,6 +578,7 @@ case "${1:-menu}" in
   off)    shift; do_off "$@";;
   status) shift; do_status "$@";;
   pfoff|pf-off|unpf|alloff) shift; do_pfoff "$@";;
+  __watch) do_watch;;
   menu|"") menu;;
   -h|--help|help)
     say "用法: ks [on|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
