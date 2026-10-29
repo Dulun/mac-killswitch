@@ -255,8 +255,9 @@ pass out quick inet proto udp from any to ${ip} port = ${port} keep state
     case "$seen" in *" ${ip2} "*) continue ;; esac
     case ",${NODE_ENDPOINTS}," in *"${ip2}:"*) continue ;; esac
     seen="${seen}${ip2} "
-    other_rules="${other_rules}block drop quick on ${tun} inet proto { tcp, udp } to ${ip2}
-block drop quick on ${tun} inet proto { tcp, udp } from ${ip2}
+    # 不限接口：不管 mihomo 把这些包从 en0 还是 utun 发出去，都掐掉
+    other_rules="${other_rules}block drop quick inet proto { tcp, udp } to ${ip2}
+block drop quick inet proto { tcp, udp } from ${ip2}
 "
   done <<< "$(node_all_endpoints)"
 
