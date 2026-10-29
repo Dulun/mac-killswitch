@@ -134,7 +134,6 @@ clash_api() {
 clash_cfg()      { clash_api GET /configs | jq -r "$1 | if . == null then empty else . end" 2>/dev/null; }
 clash_mode()     { clash_cfg '.mode'; }
 clash_tun()      { clash_cfg '.tun.enable'; }
-clash_now()      { clash_api GET /proxies | jq -r --arg n "$1" '.proxies[$n].now // empty' 2>/dev/null; }
 
 tun_device() {
   local d
@@ -280,6 +279,8 @@ EOF
 
   printf '%s' "$other_rules" >> "$f"
 
+  [ -n "$other_rules" ] || warn "profile 里没读到其它节点 IP（或全是锁定节点）：TUN 路径上没额外封堵，换节点只靠物理网卡 block"
+
   cat >> "$f" <<EOF
 
 # TUN / fake-ip 段全部放行：mihomo 自己的 DNS、DoH、节点连接都从这里走，不能按源地址区分
@@ -384,7 +385,7 @@ do_on() {
     warn "ks 没真正生效：规则不在内核（看上一条提示）"
   fi
   dim "      联网自己验：curl -s https://ipinfo.io/json ；要撤：ks off ；彻底放开：ks pfoff"
-  dim "      不通时看计数器：sudo pfctl -s rules -v（'block drop quick on ${tun} from <tun地址>' 在涨 = mihomo 出站被 TUN 吞回且不在白名单）"
+  dim "      不通时看计数器：sudo pfctl -s rules -v（'block drop quick inet ... to <其它节点IP>' 在涨 = 有别的节点在尝试出网）"
   return 0
 }
 
@@ -423,8 +424,7 @@ do_off() {
     dim "ks 没有持有 pf 引用，无需释放"
   fi
 
-  # 3. Clash 一律不动：模式、TUN、节点全由你自己管，ks off 只管防火墙
-  # 4. 如实汇报系统 pf —— 那是 macOS 自己的事，ks 不去关它
+  # 3. Clash 一律不动（模式/TUN/节点由你自己管）；只如实汇报系统 pf —— 那是 macOS 自己的事
   if fw_enabled; then
     warn "系统 pf 仍为开启（$(pf_holders)由 macOS/其他软件自己管理），ks 只清了自己那份"
   else
@@ -501,7 +501,7 @@ do_pfoff() {
 menu() {
   while :; do
     say ""
-    do_status fast
+    do_status
     say "  1) 开启   → 设全局 + 锁当前节点 + 阻断全部旁路（TUN 需你先在 Verge 里开着）"
     say "  2) 关闭   → 清掉 ks 自己的规则与引用 + 恢复 Clash 规则模式（不动系统 pf）"
     say "  3) 状态   → 重新检查并刷新当前状态"
