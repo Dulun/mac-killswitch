@@ -191,6 +191,13 @@ find_active_node() {
 
 VERGE_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 
+# 规则里实际放行的节点端点（从 .build/pf.rules 反读，最可信）
+allow_eps() {
+  [ -f "$BUILD_DIR/pf.rules" ] || return 0
+  sed -n 's/^pass out quick inet proto [a-z]* from any to \([^ ]*\) port = \([0-9]*\).*/\1:\2/p' "$BUILD_DIR/pf.rules" \
+    | sort -u | paste -sd, -
+}
+
 # 节点的 server:port（只读 profile，不做 DNS，纯本地）
 node_addr() {
   local pf
@@ -476,7 +483,7 @@ do_status() {
   dim "         $(pfq -s info | grep -o 'Status: .*')"
 
   if [ -n "${SOCK:-}" ]; then
-    local cur_node locked_node cur_addr
+    local cur_node locked_node cur_addr eps
     cur_node="$(find_active_node)"
     cur_addr="$(node_addr "$cur_node")"
     say "Clash 模式：$(clash_mode)   TUN 虚拟网卡：$(clash_tun)"
@@ -484,10 +491,11 @@ do_status() {
     # ks 只锁「on 那一刻」的节点端点；之后换节点，新节点的包会被丢（fail-closed），不会跟着切
     if ks_rules_loaded && [ -f "$STATE_DIR/node" ]; then
       locked_node="$(cat "$STATE_DIR/node" 2>/dev/null)"
+      eps="$(allow_eps)"
       if [ "$cur_node" != "$locked_node" ]; then
         bad "节点已从 ${locked_node} 切到 ${cur_node}：白名单里只有前者，现在出网应全部被丢（要换出口：ks off → 选节点 → ks on）"
       else
-        dim "      白名单锁定：${locked_node}（换到别的节点会断网）"
+        dim "      白名单锁定：${locked_node}（放行端点 ${eps:-空 = 全断}；换到别的节点会断网）"
       fi
     fi
   else
