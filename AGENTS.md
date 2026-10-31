@@ -17,7 +17,7 @@ macOS 上的 fail-closed 网络开关：用 `pf` 只放行「Clash TUN + 一个�
 - **`198.18.0.0/16` 整段放行**（`tun` 上），应用流量与 mihomo 内部流量共用这条路径，无法区分。
 - **不要加后台守护进程**：换节点断网/切回恢复完全由静态规则表达（其它节点 IP 双向封 + 锁定节点放行）。
 - **"锁一个节点" = 封其它节点**：从 profile 读出所有节点 IP，扣掉锁定节点，逐个
-  `block drop quick inet proto { tcp, udp } to/from <ip>`，**不限接口**（en0 / utun 都要拦；hysteria2 会换端口，只封 `ip:port` 会漏）。
+  `block drop quick inet proto { tcp, udp } to/from <ip>`，**不限接口**（en0 / utun 都要拦）。不同机器的节点封整条 IP（hysteria2 会换端口）；**与锁定节点同 IP 不同端口的**（xtls 8881 / hy2 8882）按 `ip + port` 封，否则同机会漏。
 
 另外两条必须保留：
 

@@ -280,19 +280,26 @@ pass out quick inet proto udp from any to ${ip} port = ${port} keep state
 "
   done
 
-  # profile 里其它节点的服务器 IP：TUN 路径上按 IP 整条封（不限端口 —— hysteria2 的
-  # QUIC 端口可能被端口跳跃/回退换掉，只封 ip:port 会漏）。
-  local other_rules="" ep2 ip2 seen=" "
+  # 其它节点：不跟锁定节点同机的，按 IP 整条封（hy2 会换端口，只封 ip:port 会漏）；
+  # 跟锁定节点同 IP 的（同一台机器不同端口，例如 xtls 8881 / hy2 8882），只能按端口封。
+  local other_rules="" ep2 ip2 port2 seen_ip=" " seen_ep=" "
   while IFS= read -r ep2; do
     [ -z "$ep2" ] && continue
-    ip2="${ep2%%:*}"
-    case "$seen" in *" ${ip2} "*) continue ;; esac
-    case ",${NODE_ENDPOINTS}," in *"${ip2}:"*) continue ;; esac
-    seen="${seen}${ip2} "
-    # 不限接口：不管 mihomo 把这些包从 en0 还是 utun 发出去，都掐掉
-    other_rules="${other_rules}block drop quick inet proto { tcp, udp } to ${ip2}
+    ip2="${ep2%%:*}"; port2="${ep2#*:}"
+    case ",${NODE_ENDPOINTS}," in *",${ip2}:${port2},"*) continue ;; esac
+    if case ",${NODE_ENDPOINTS}," in *",${ip2}:"*) true ;; *) false ;; esac; then
+      case "$seen_ep" in *" ${ip2}:${port2} "*) continue ;; esac
+      seen_ep="${seen_ep}${ip2}:${port2} "
+      other_rules="${other_rules}block drop quick inet proto { tcp, udp } to ${ip2} port = ${port2}
+block drop quick inet proto { tcp, udp } from ${ip2} port = ${port2}
+"
+    else
+      case "$seen_ip" in *" ${ip2} "*) continue ;; esac
+      seen_ip="${seen_ip}${ip2} "
+      other_rules="${other_rules}block drop quick inet proto { tcp, udp } to ${ip2}
 block drop quick inet proto { tcp, udp } from ${ip2}
 "
+    fi
   done <<< "$(node_all_endpoints)"
 
   # DoH 放行（物理网卡）

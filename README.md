@@ -76,9 +76,12 @@ sudo pfctl -s References -v   # 看 pf 到底是谁开着的
 ```
 block drop all
 
-# 其它节点：任意接口、双向、任意端口全封（hy2 会换端口，只封 ip:port 会漏）
-block drop quick inet proto { tcp, udp } to   179.255.127.122
-block drop quick inet proto { tcp, udp } from 179.255.127.122
+# 其它节点：任意接口、双向全封。不同机器的整条 IP 封（hy2 会换端口，只封 ip:port 会漏）；
+# 跟锁定节点同机不同端口的（xtls 8881 / hy2 8882）按端口封
+block drop quick inet proto { tcp, udp } to   179.255.127.122 port = 8882
+block drop quick inet proto { tcp, udp } from 179.255.127.122 port = 8882
+block drop quick inet proto { tcp, udp } to   44.250.23.201
+block drop quick inet proto { tcp, udp } from 44.250.23.201
 ...
 
 pass quick on lo0 all
