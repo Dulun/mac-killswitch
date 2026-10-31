@@ -32,6 +32,9 @@ fi
 # config.env 里手填的端点（可为空）；do_on 每次都用这个初值，避免菜单里反复按 1 时串到上一次的结果
 : "${NODE_ENDPOINTS:=}"
 CFG_NODE_ENDPOINTS="$NODE_ENDPOINTS"
+# 1 = 锁定节点所在 IP 上的所有端口/协议都放行（同机的其它节点也能用）
+: "${SAME_IP_ALLOW:=0}"
+CFG_SAME_IP_ALLOW="$SAME_IP_ALLOW"
 : "${DNS_SERVERS:=114.114.114.114 223.5.5.5 223.6.6.6 119.29.29.29}"
 : "${DOH_HOSTS:=dns.alidns.com doh.pub}"
 : "${LAN_CIDRS:=192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 169.254.0.0/16 224.0.0.0/4}"
@@ -266,8 +269,9 @@ gen_rules() {
   local tun="$1"
   local f="$BUILD_DIR/pf.rules"
 
-  # 锁定节点的端点：物理网卡上放行这一份
-  local ep_rules="" ep="" ip port
+  # 锁定节点的端点：物理网卡上放行这一份。
+  # SAME_IP_ALLOW=1 时放行整个 IP（任意端口/协议），同机的其它节点也能用。
+  local ep_rules="" ep="" ip port seen_pass=" "
   IFS=',' read -ra ADDR <<< "$NODE_ENDPOINTS"
   for ep in "${ADDR[@]}"; do
     ep="$(printf '%s' "$ep" | tr -d ' ')"
@@ -275,9 +279,16 @@ gen_rules() {
     ip="${ep%%:*}"
     port="${ep#*:}"
     if [ -z "$port" ] || [ "$port" = "$ip" ]; then port="443"; fi
-    ep_rules="${ep_rules}pass out quick inet proto tcp from any to ${ip} port = ${port} flags S/SA keep state
+    if [ "$SAME_IP_ALLOW" = "1" ]; then
+      case "$seen_pass" in *" ${ip} "*) continue ;; esac
+      seen_pass="${seen_pass}${ip} "
+      ep_rules="${ep_rules}pass out quick inet from any to ${ip} keep state
+"
+    else
+      ep_rules="${ep_rules}pass out quick inet proto tcp from any to ${ip} port = ${port} flags S/SA keep state
 pass out quick inet proto udp from any to ${ip} port = ${port} keep state
 "
+    fi
   done
 
   # 其它节点：不跟锁定节点同机的，按 IP 整条封（hy2 会换端口，只封 ip:port 会漏）；
@@ -288,6 +299,8 @@ pass out quick inet proto udp from any to ${ip} port = ${port} keep state
     ip2="${ep2%%:*}"; port2="${ep2#*:}"
     case ",${NODE_ENDPOINTS}," in *",${ip2}:${port2},"*) continue ;; esac
     if case ",${NODE_ENDPOINTS}," in *",${ip2}:"*) true ;; *) false ;; esac; then
+      # 与锁定节点同 IP：SAME_IP_ALLOW=1 时整条 IP 放行，否则只封这个端口
+      [ "$SAME_IP_ALLOW" = "1" ] && continue
       case "$seen_ep" in *" ${ip2}:${port2} "*) continue ;; esac
       seen_ep="${seen_ep}${ip2}:${port2} "
       other_rules="${other_rules}block drop quick inet proto { tcp, udp } to ${ip2} port = ${port2}
@@ -339,6 +352,12 @@ EOF
 }
 
 do_on() {
+  # 每次都用 config.env 的初值，避免菜单里反复执行时串值
+  NODE_ENDPOINTS="$CFG_NODE_ENDPOINTS"
+  SAME_IP_ALLOW="$CFG_SAME_IP_ALLOW"
+  case "${1:-}" in
+    --same-ip|sameip) SAME_IP_ALLOW=1 ;;
+  esac
   # ks on 永远不"失败"：每一步只看、只提示，能做多少做多少，退出码 0
   if ! ensure_sudo; then
     warn "没拿到管理员权限：pf 一点没动（这不是 ks 失败）"
@@ -373,7 +392,6 @@ do_on() {
   esac
 
   # 4. 节点端点 (IP:PORT)：每次重新算（同一个菜单进程里反复按 1 也不会沿用上一次的节点）
-  NODE_ENDPOINTS="$CFG_NODE_ENDPOINTS"
   if [ -z "$NODE_ENDPOINTS" ] && [ -n "$node" ]; then
     NODE_ENDPOINTS="$(detect_endpoints "$node")"
   fi
@@ -420,7 +438,11 @@ do_on() {
   printf '%s on user=%s tty=%s pid=%s node=%s ref=%s loaded=%s\n' "$(date '+%F %T')" "$(id -un)" "$(tty_id)" "$$" "${node:-?}" "${tok:-none}" "$loaded" >> "$STATE_DIR/ks.log"
 
   if [ "$loaded" = "1" ] && ks_rules_loaded; then
+    if [ "$SAME_IP_ALLOW" = "1" ]; then
+    ok "ks 已开启：出口锁定 ${node:-未读到}（${NODE_ENDPOINTS:-无端点}；同 IP 全端口/全协议放行）"
+  else
     ok "ks 已开启：出口锁定 ${node:-未读到}（${NODE_ENDPOINTS:-无端点}）"
+  fi
     say "      之后在 Clash 里换节点 = 新节点没在白名单里 = 断网；要换出口：ks off → 选好节点 → ks on。"
   else
     warn "ks 没真正生效：规则不在内核（看上一条提示）"
@@ -537,15 +559,17 @@ menu() {
     say "  1) 开启   → 锁当前节点 + 阻断全部旁路（TUN/模式由你在 Verge 里管）"
     say "  2) 关闭   → 只清 ks 自己的规则与 pf 引用（Clash 一律不动）"
     say "  3) 状态   → 重新检查并刷新当前状态"
+    say "  5) 开启（同 IP 全放行）→ 锁定节点所在 IP 的任意端口/协议都放行"
     say "  4) 关掉所有 pf → 终极恢复（连系统/别人的引用一起压掉，纯裸奔）"
     say "  q) 退出菜单"
-    printf "请选择 [1/2/3/4/q]: "
+    printf "请选择 [1/2/3/4/5/q]: "
     read -r c
     case "$c" in
       1) do_on;;
       2) do_off;;
       3) do_status;;
       4) do_pfoff;;
+      5) do_on --same-ip;;
       q|Q) break;;
       *) say "无效输入";;
     esac
@@ -559,11 +583,11 @@ case "${1:-menu}" in
   pfoff|pf-off|unpf|alloff) shift; do_pfoff "$@";;
   menu|"") menu;;
   -h|--help|help)
-    say "用法: ks [on|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
+    say "用法: ks [on [--same-ip]|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
     ;;
   *)
     say "未知命令: $1"
-    say "用法: ks [on|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
+    say "用法: ks [on [--same-ip]|off|status|pfoff|menu]    pfoff = 关掉所有 pf（终极恢复）"
     exit 1
     ;;
 esac

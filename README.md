@@ -41,7 +41,8 @@ alias ks="$HOME/Documents/dev/mac-killswitch/killswitch.sh"
 
 ```bash
 ks                # 菜单：1 开启 / 2 关闭 / 3 状态 / 4 关掉所有 pf / q 退出
-ks on             # 锁定当前节点 + 装规则
+ks on             # 锁定当前节点（只放行它的 ip:端口）
+ks on --same-ip   # 锁定节点所在 IP：该 IP 上任意端口/协议都放行（同机的其它节点也能用）
 ks off            # 只清 ks 的东西：规则还原 /etc/pf.conf + 释放自己的 pf 引用；Clash 一律不动
 ks status         # 纯读内核 + 只读 Clash，不联网
 ks pfoff          # 终极恢复：pfctl -d，整个 pf 关掉（含系统/别人的引用，纯裸奔）
@@ -60,6 +61,10 @@ curl -s https://ipinfo.io/json     # 出口 IP 应该等于锁定节点
 - 在 Clash 里切到别的节点 → 那个节点的服务器 IP 已在封堵名单里 → **立刻断网**；
 - 切回锁定节点 → 它的 `IP:端口` 一直在放行名单里 → **立刻恢复**；
 - 想换成另一个出口：`ks off` → 选节点 → `ks on`，旧节点自动进入封堵名单。
+
+默认按 `ip:端口` 锁；`ks on --same-ip`（或 `config.env` 里 `SAME_IP_ALLOW=1`）改成按 IP 锁：
+同一个 IP 上的所有端口/协议都放行 —— 适合同一台机器上挂了 xtls(8881)+hy2(8882) 两个节点、
+你想两个都能用的情况。
 
 ### 一键关掉（没网时的救命命令）
 
