@@ -29,7 +29,9 @@ fi
 
 [ -f "$ROOT_DIR/config.env" ] && . "$ROOT_DIR/config.env"
 
+# config.env 里手填的端点（可为空）；do_on 每次都用这个初值，避免菜单里反复按 1 时串到上一次的结果
 : "${NODE_ENDPOINTS:=}"
+CFG_NODE_ENDPOINTS="$NODE_ENDPOINTS"
 : "${DNS_SERVERS:=114.114.114.114 223.5.5.5 223.6.6.6 119.29.29.29}"
 : "${DOH_HOSTS:=dns.alidns.com doh.pub}"
 : "${LAN_CIDRS:=192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 169.254.0.0/16 224.0.0.0/4}"
@@ -356,7 +358,8 @@ do_on() {
     *) ok "当前出网节点：${node}" ;;
   esac
 
-  # 4. 节点端点 (IP:PORT)：读不到就提示，不拦
+  # 4. 节点端点 (IP:PORT)：每次重新算（同一个菜单进程里反复按 1 也不会沿用上一次的节点）
+  NODE_ENDPOINTS="$CFG_NODE_ENDPOINTS"
   if [ -z "$NODE_ENDPOINTS" ] && [ -n "$node" ]; then
     NODE_ENDPOINTS="$(detect_endpoints "$node")"
   fi
@@ -516,8 +519,8 @@ menu() {
   while :; do
     say ""
     do_status
-    say "  1) 开启   → 设全局 + 锁当前节点 + 阻断全部旁路（TUN 需你先在 Verge 里开着）"
-    say "  2) 关闭   → 清掉 ks 自己的规则与引用 + 恢复 Clash 规则模式（不动系统 pf）"
+    say "  1) 开启   → 锁当前节点 + 阻断全部旁路（TUN/模式由你在 Verge 里管）"
+    say "  2) 关闭   → 只清 ks 自己的规则与 pf 引用（Clash 一律不动）"
     say "  3) 状态   → 重新检查并刷新当前状态"
     say "  4) 关掉所有 pf → 终极恢复（连系统/别人的引用一起压掉，纯裸奔）"
     say "  q) 退出菜单"
